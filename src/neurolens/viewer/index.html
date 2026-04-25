@@ -38,6 +38,9 @@
   .iter-label { font-variant-numeric: tabular-nums; min-width: 90px; color: var(--dim); }
   .image-wrap { background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center; }
   .image-wrap img { max-width: 100%; max-height: 100%; display: block; }
+  .heatmap-wrap { background: #000; border-radius: 8px; overflow: hidden; margin: 10px 0 6px; }
+  .heatmap-wrap img { width: 100%; height: auto; display: block; }
+  .heatmap-note { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
   .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .compare figcaption { font-size: 12px; color: var(--dim); text-align: center; padding: 6px 0; }
 
@@ -118,6 +121,8 @@
   <!-- RIGHT: brain + bars + reward -->
   <section class="panel">
     <h2>Predicted brain activation</h2>
+    <div class="heatmap-wrap"><img id="fmri-map" alt="fMRI heatmap" /></div>
+    <div class="heatmap-note" id="fmri-note">Atlas heatmap (nilearn) if available; otherwise schematic only.</div>
     <svg class="brain" id="brain" viewBox="0 0 400 240" aria-label="schematic brain map"></svg>
     <div class="legend">
       <span><span class="swatch" style="background:#244"></span> low</span>
@@ -136,7 +141,7 @@
 
 <footer>
   Schematic brain layout — region positions are approximate, not anatomically registered.
-  For real fMRI heatmaps wire up nilearn + HCP atlas (see <code>rois.py</code>).
+  Atlas heatmaps render when nilearn is installed and the run includes <code>fmri_XX.png</code> outputs.
 </footer>
 
 <div class="roi-tooltip" id="tip"></div>
@@ -246,6 +251,18 @@ function render(i) {
   document.getElementById("img-before").src = "./" + meta.frames[0];
   document.getElementById("img-after").src  = "./" + (meta.frames[i] || meta.frames[meta.frames.length - 1]);
   document.getElementById("after-cap").textContent = i === 0 ? "baseline (same)" : `iter ${i}`;
+  const fmriMap = document.getElementById("fmri-map");
+  const fmriNote = document.getElementById("fmri-note");
+  if ((meta.heatmaps || []).length) {
+    const hm = meta.heatmaps[Math.min(i, meta.heatmaps.length - 1)];
+    fmriMap.src = "./" + hm;
+    fmriMap.style.display = "block";
+    fmriNote.textContent = `Atlas heatmap: ${hm}`;
+  } else {
+    fmriMap.removeAttribute("src");
+    fmriMap.style.display = "none";
+    fmriNote.textContent = "Atlas heatmap not found for this run (install nilearn and rerun optimize).";
+  }
 
   // Update brain ROI colors
   for (const r of REGIONS) {

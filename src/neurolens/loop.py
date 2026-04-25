@@ -79,9 +79,36 @@ def run(
 
     records: list[dict[str, Any]] = []
     prev_scores: dict[str, float] | None = None
+    can_render_heatmap = False
+    heatmap_error_printed = False
+
+    atlas = getattr(encoder, "atlas", None)
+    masks = getattr(encoder, "masks", None)
+    if atlas is not None and masks is not None:
+        can_render_heatmap = True
+
+    def _maybe_render_heatmap(iteration: int, scores: dict[str, float]) -> None:
+        nonlocal can_render_heatmap, heatmap_error_printed
+        if not can_render_heatmap:
+            return
+        try:
+            from .rois import render_heatmap_png
+
+            render_heatmap_png(
+                scores,
+                atlas=atlas,
+                masks=masks,
+                out_path=run_dir / f"fmri_{iteration:02d}.png",
+            )
+        except ImportError as e:
+            can_render_heatmap = False
+            if not heatmap_error_printed:
+                print(f"heatmap rendering disabled: {e}")
+                heatmap_error_printed = True
 
     for i in range(config.iterations + 1):
         scores = encoder.encode(img)
+        _maybe_render_heatmap(i, scores)
         reward = reward_compute(scores, config.intent)
         ethics = ethics_evaluate(scores, config.intent, prev_scores)
 
