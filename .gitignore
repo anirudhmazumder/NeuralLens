@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+runs/
+*.nii
+*.nii.gz
+.DS_Store

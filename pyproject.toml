@@ -1,0 +1,40 @@
+[project]
+name = "neurolens"
+version = "0.1.0"
+description = "AI-powered UI design optimization using brain activation prediction (TRIBE v2)"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+neuro = [
+    "nilearn>=0.10",
+    "nibabel>=5.2",
+    "torch>=2.2",
+    "transformers>=4.40",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+neurolens = "neurolens.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"neurolens.viewer" = ["index.html"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
