@@ -264,6 +264,57 @@ def synthetic_atlas(shape: tuple[int, int, int] = (16, 16, 16)) -> Atlas:
     return Atlas(labels=labels, affine=affine, name_to_index=dict(KNOWN_LH_INDICES))
 
 
+def scores_to_volume(scores: dict[str, float], atlas: Atlas, masks: RegionMasks) -> "np.ndarray":
+    """Project region scores back into atlas voxel space."""
+    import numpy as np
+
+    vol = np.zeros(atlas.shape, dtype=np.float32).ravel()
+    for region_name, mask in masks.masks.items():
+        val = float(scores.get(region_name, 0.0))
+        vol[mask] = val
+    return vol.reshape(atlas.shape)
+
+
+def render_heatmap_png(
+    scores: dict[str, float],
+    atlas: Atlas,
+    masks: RegionMasks,
+    out_path: str | Path,
+    *,
+    threshold: float = 0.05,
+) -> Path:
+    """Render an fMRI-like stat map PNG with nilearn.
+
+    Raises ImportError if nilearn/nibabel/matplotlib are unavailable.
+    """
+    from pathlib import Path as _Path
+
+    try:
+        import nibabel as nib
+        from nilearn import plotting
+    except ImportError as e:
+        raise ImportError(
+            "Heatmap rendering needs nilearn + nibabel. Install with: pip install -e '.[neuro]'"
+        ) from e
+
+    volume = scores_to_volume(scores, atlas, masks)
+    img = nib.Nifti1Image(volume, atlas.affine)
+    out = _Path(out_path)
+    display = plotting.plot_stat_map(
+        img,
+        bg_img=None,
+        threshold=threshold,
+        display_mode="z",
+        cut_coords=7,
+        cmap="inferno",
+        colorbar=True,
+        black_bg=True,
+    )
+    display.savefig(str(out))
+    display.close()
+    return out
+
+
 def _identity_affine():
     import numpy as np
 

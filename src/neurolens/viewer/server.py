@@ -46,8 +46,15 @@ def _frames_in(run_dir: Path) -> list[str]:
 
 
 def _write_index_json(run_dir: Path) -> None:
+    heatmaps = sorted(
+        (p.name for p in run_dir.glob("fmri_*.png")),
+        key=lambda n: int(re.search(r"fmri_(\d+)\.png", n).group(1)) if re.search(r"fmri_(\d+)\.png", n) else -1,
+    )
     (run_dir / "index.json").write_text(
-        json.dumps({"run_name": run_dir.name, "frames": _frames_in(run_dir)}, indent=2)
+        json.dumps(
+            {"run_name": run_dir.name, "frames": _frames_in(run_dir), "heatmaps": heatmaps},
+            indent=2,
+        )
     )
 
 
