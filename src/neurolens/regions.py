@@ -4,15 +4,20 @@ Each region carries the metadata needed by the reward function, the agent
 prompt, and the transparency report. Keeping this in one place means
 adding/tuning a region is a single-file edit.
 
-HCP indices are placeholders — the real HCP-MMP1 parcellation has 360 regions
-indexed 1..360 (left + right hemisphere). When the real atlas loads, fill these
-in from Glasser et al. (2016) supplement Table S2. Until then, the stub encoder
-generates synthetic activations keyed by region name.
+The `glasser_names` field lists the HCP-MMP1 (Glasser 2016) region names that
+make up each ROI, expressed without hemisphere prefix. Both hemispheres are
+included automatically - for `FFC`, the atlas contains `L_FFC_ROI` and
+`R_FFC_ROI` and we average across both.
+
+HCP-MMP1 is cortical-only. Regions marked `cortical=False` (Hippocampus,
+Amygdala, NAcc) are subcortical and require a separate atlas (Harvard-Oxford
+subcortical or AAL). Until that is wired up, those regions remain
+stub-encoder-only and should be flagged in reports.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 
@@ -23,18 +28,19 @@ Category = Literal["engagement", "trust", "penalty", "dual", "language"]
 class Region:
     name: str
     category: Category
-    hcp_indices: tuple[int, ...]
+    glasser_names: tuple[str, ...]  # HCP-MMP1 names, hemisphere-agnostic
     drives: str
     agent_hint: str
     full_name: str = ""
+    cortical: bool = True  # False = needs subcortical atlas (not in HCP-MMP1)
 
 
 REGIONS: dict[str, Region] = {
     "FFA": Region(
         name="FFA",
-        full_name="Fusiform Face Area",
+        full_name="Fusiform Face Area (HCP: FFC)",
         category="engagement",
-        hcp_indices=(18, 22, 198, 202),
+        glasser_names=("FFC",),
         drives="Human faces, eye contact, emotional expressions",
         agent_hint=(
             "FFA score is {score:.2f}. To increase it, consider adding a human face, "
@@ -44,9 +50,9 @@ REGIONS: dict[str, Region] = {
     ),
     "V4": Region(
         name="V4",
-        full_name="Color-Selective Cortex (V4)",
+        full_name="Color-Selective Cortex (HCP: V4)",
         category="engagement",
-        hcp_indices=(6, 7, 186, 187),
+        glasser_names=("V4",),
         drives="Color saturation, hue contrast, bold complementary palettes",
         agent_hint=(
             "V4 score is {score:.2f}. To increase it, consider raising saturation of "
@@ -56,9 +62,9 @@ REGIONS: dict[str, Region] = {
     ),
     "MT+": Region(
         name="MT+",
-        full_name="Motion Area (MT+/V5)",
+        full_name="Motion Complex (HCP: MT, MST, V4t, FST)",
         category="engagement",
-        hcp_indices=(2, 23, 182, 203),
+        glasser_names=("MT", "MST", "V4t", "FST"),
         drives="Implied motion: arrows, diagonal layouts, blur trails, action poses",
         agent_hint=(
             "MT+ score is {score:.2f}. To increase it, add directional cues "
@@ -68,21 +74,21 @@ REGIONS: dict[str, Region] = {
     ),
     "Hippocampus": Region(
         name="Hippocampus",
-        full_name="Hippocampus",
+        full_name="Hippocampus (subcortical - separate atlas needed)",
         category="engagement",
-        hcp_indices=(120, 300),  # subcortical; placeholder — real HCP focuses on cortex
+        glasser_names=(),
         drives="Novelty, distinctiveness, memorable / unexpected design choices",
         agent_hint=(
             "Hippocampus score is {score:.2f}. Suggest one distinctive element that "
-            "differentiates this UI from generic templates — a unique illustration, "
-            "an unexpected layout choice, or a memorable brand color application."
+            "differentiates this UI from generic templates."
         ),
+        cortical=False,
     ),
     "PFC": Region(
         name="PFC",
-        full_name="Dorsolateral Prefrontal Cortex (DLPFC)",
+        full_name="Dorsolateral Prefrontal Cortex (HCP: 46, 9-46d, p9-46v, a9-46v)",
         category="trust",
-        hcp_indices=(70, 71, 250, 251),
+        glasser_names=("46", "9-46d", "p9-46v", "a9-46v"),
         drives="Clear hierarchy, whitespace, readable typography, calm layout",
         agent_hint=(
             "PFC score is {score:.2f}. To increase it, reduce visual clutter, improve "
@@ -92,9 +98,9 @@ REGIONS: dict[str, Region] = {
     ),
     "ACC": Region(
         name="ACC",
-        full_name="Anterior Cingulate Cortex",
+        full_name="Anterior Cingulate (HCP: a24, p24, p32, s32, 24dd, 24dv)",
         category="penalty",
-        hcp_indices=(60, 240),
+        glasser_names=("a24", "p24", "p32", "s32", "24dd", "24dv"),
         drives="Confusion: too many CTAs, ambiguous labels, contradictory signals",
         agent_hint=(
             "ACC score is {score:.2f} (high = bad). Reduce it by clarifying the "
@@ -103,20 +109,21 @@ REGIONS: dict[str, Region] = {
     ),
     "Amygdala": Region(
         name="Amygdala",
-        full_name="Amygdala",
+        full_name="Amygdala (subcortical - separate atlas needed)",
         category="penalty",
-        hcp_indices=(150, 330),  # subcortical placeholder
+        glasser_names=(),
         drives="Threat/anxiety: red urgency, countdowns, scarcity, FOMO copy",
         agent_hint=(
             "Amygdala score is {score:.2f} (high = bad / dark-pattern risk). "
             "Reduce urgency-coded colors, remove countdowns, soften scarcity copy."
         ),
+        cortical=False,
     ),
     "Insula": Region(
         name="Insula",
-        full_name="Insular Cortex",
+        full_name="Insular Cortex (HCP: AAIC, AVI, MI, PI)",
         category="penalty",
-        hcp_indices=(105, 285),
+        glasser_names=("AAIC", "AVI", "MI", "PI"),
         drives="Visceral unease: clashing colors, low contrast, visual clutter",
         agent_hint=(
             "Insula score is {score:.2f} (high = bad). Improve color harmony, raise "
@@ -125,14 +132,15 @@ REGIONS: dict[str, Region] = {
     ),
     "NAcc": Region(
         name="NAcc",
-        full_name="Nucleus Accumbens",
+        full_name="Nucleus Accumbens (subcortical - separate atlas needed)",
         category="dual",
-        hcp_indices=(140, 320),
+        glasser_names=(),
         drives="Reward anticipation: variable rewards, badges, streaks, near-completion",
         agent_hint=(
             "NAcc score is {score:.2f}. Treated as a target for gamification intent, "
             "as a penalty otherwise (compulsion risk)."
         ),
+        cortical=False,
     ),
 }
 
@@ -143,3 +151,11 @@ def by_category(cat: Category) -> list[Region]:
 
 def all_names() -> list[str]:
     return list(REGIONS.keys())
+
+
+def cortical_names() -> list[str]:
+    return [n for n, r in REGIONS.items() if r.cortical]
+
+
+def subcortical_names() -> list[str]:
+    return [n for n, r in REGIONS.items() if not r.cortical]

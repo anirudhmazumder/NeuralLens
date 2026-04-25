@@ -215,9 +215,68 @@ class TribeV2Encoder:
         raise NotImplementedError
 
 
-def load_encoder(name: str = "stub") -> Encoder:
+@dataclass
+class AtlasStubEncoder:
+    """Synthetic-voxels-through-real-atlas encoder."""
+
+    atlas: "object"
+    masks: "object"
+
+    def encode(self, image: Image.Image) -> dict[str, float]:
+        import numpy as np
+
+        feats = {
+            "FFA": _sigmoid(_skin_fraction(image) * 6.0, center=0.5),
+            "V4": _sigmoid(_saturation(image), center=0.4, k=8.0),
+            "MT+": _sigmoid(_edge_diagonality(image), center=0.45, k=8.0),
+            "PFC": _sigmoid(
+                0.6 * _whitespace_fraction(image)
+                + 0.4 * _luma_contrast(image)
+                - 0.5 * _palette_clash(image),
+                center=0.3,
+            ),
+            "ACC": _sigmoid(
+                _edge_diagonality(image) * (1.0 - _whitespace_fraction(image)),
+                center=0.45,
+                k=7.0,
+            ),
+            "Insula": _sigmoid(_palette_clash(image), center=0.4, k=8.0),
+        }
+
+        voxels = np.zeros(self.atlas.labels.shape, dtype=np.float32).ravel()
+        rng = np.random.default_rng(42)
+        for region_name, base in feats.items():
+            mask = self.masks.masks.get(region_name)
+            if mask is None:
+                continue
+            n = int(mask.sum())
+            voxels[mask] = base + rng.normal(0.0, 0.03, size=n).astype(np.float32)
+
+        from .rois import aggregate
+
+        cortical_scores = aggregate(voxels, self.masks, normalize=False)
+        sat = _saturation(image)
+        contrast = _luma_contrast(image)
+        white = _whitespace_fraction(image)
+        red = _red_dominance(image)
+
+        out: dict[str, float] = dict(cortical_scores)
+        out["Hippocampus"] = _novelty_hash(image)
+        out["Amygdala"] = _sigmoid(0.6 * red + 0.4 * (1.0 - white), center=0.55, k=8.0)
+        out["NAcc"] = _sigmoid(sat * contrast, center=0.35, k=8.0)
+        assert set(out) == set(all_names()), f"AtlasStubEncoder missing: {set(all_names()) - set(out)}"
+        return out
+
+
+def load_encoder(name: str = "stub", **kwargs) -> Encoder:
     if name == "stub":
         return StubEncoder()
+    if name == "atlas":
+        atlas = kwargs.get("atlas")
+        masks = kwargs.get("masks")
+        if atlas is None or masks is None:
+            raise ValueError("atlas encoder needs atlas= and masks= kwargs")
+        return AtlasStubEncoder(atlas=atlas, masks=masks)
     if name == "tribe":
         return TribeV2Encoder()
     raise ValueError(f"unknown encoder: {name!r}")

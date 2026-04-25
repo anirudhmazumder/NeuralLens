@@ -6,7 +6,7 @@ Pipeline: UI screenshot → predicted fMRI activation (TRIBE v2) → ROI scoring
 
 ## Status
 
-Hackathon scaffolding. The pipeline runs end-to-end today using a **deterministic stub encoder** in place of TRIBE v2 inference, so you can iterate on reward design, ethics guardrails, and the agent loop without a GPU. Real TRIBE v2 / nilearn HCP integration lands behind the `neuro` extra (see `src/neurolens/tribe.py` and `src/neurolens/rois.py` TODOs).
+Hackathon scaffolding. The pipeline runs end-to-end today with an **atlas-backed demo encoder** (real HCP-MMP1 masks plus synthetic voxel activations), so you can exercise ROI aggregation and reward dynamics without a GPU. Full TRIBE v2 inference remains behind the `neuro` extra (see `src/neurolens/tribe.py`).
 
 ## Install
 
@@ -20,8 +20,11 @@ pip install -e '.[dev]'      # tests
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
+neurolens fetch-atlas
 neurolens optimize path/to/screenshot.png --intent engage --iters 5
 ```
+
+`neurolens optimize` now defaults to `--encoder atlas`. If the atlas file is missing, it falls back to a synthetic mini-atlas and prints a notice.
 
 Outputs land in `runs/<timestamp>/`: per-iteration screenshots, region score JSON, and a plain-language transparency report.
 
@@ -29,8 +32,8 @@ Outputs land in `runs/<timestamp>/`: per-iteration screenshots, region score JSO
 
 | Component | Module | Notes |
 |-----------|--------|-------|
-| Brain encoder | `tribe.py` | TRIBE v2 wrapper; deterministic stub by default |
-| ROI aggregation | `rois.py` | Voxels → 8 named regions via HCP atlas (stubbed) |
+| Brain encoder | `tribe.py` | Atlas-backed demo encoder by default; TRIBE v2 wrapper in progress |
+| ROI aggregation | `rois.py` | Voxels → named regions via HCP-MMP1 masks |
 | Reward | `reward.py` | Intent-aware targets + penalties + Yerkes-Dodson ceiling |
 | Ethics | `ethics.py` | Dark pattern detector, valence check, intent gating |
 | Agent | `agent.py` | Claude (Opus 4.7) suggests one edit per iteration |
