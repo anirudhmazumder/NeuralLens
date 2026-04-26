@@ -127,8 +127,3 @@ The platform is fully demoable end-to-end:
 - uploaded HTML optimization with downloadable output,
 - and multi-agent integration via FetchAI Agenteverse.
 
-## Submission-Oriented Project Rundown
-
-For a fuller hackathon narrative, see:
-
-- `neurallens/HACKATHON_SUBMISSION_DRAFT.md`
