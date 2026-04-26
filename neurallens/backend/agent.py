@@ -1,9 +1,9 @@
-"""Vision-aware LLM optimization agent.
+"""Vision-aware Claude optimization agent.
 
 Two modes:
-  stub  (default, OPENAI_LIVE=false) — calls fake_llm_edit, cycles through
+  stub  (default, CLAUDE_LIVE=false) — calls fake_llm_edit, cycles through
         action types systematically.
-  live  (OPENAI_LIVE=true) — uses GPT-4.1-nano (OpenAI) with vision + memory.
+  live  (CLAUDE_LIVE=true) — uses Claude (claude-sonnet-4-6) with vision + memory.
 
 Memory context is injected every call so the model learns across sessions:
   - action_stats: per-type avg_reward, success_rate, count from SQLite
@@ -12,6 +12,10 @@ Memory context is injected every call so the model learns across sessions:
 Gaze context (when provided):
   - Ranked salient regions from GazePredictor
   - Agent is instructed to prioritize edits in highest-saliency regions
+
+Brain region context (when provided):
+  - Full 9-region activation scores from brain_regions.score_screenshot()
+  - Ethics flags surfaced to the agent so it can self-correct
 
 select_action() returns a structured edit dict every call.
 """
@@ -30,10 +34,12 @@ if TYPE_CHECKING:
 
 _BASE_SYSTEM = """\
 You are NeuralLens, a neural engagement optimizer. You analyze webpages and \
-propose precise edits to maximize predicted brain activation as measured by \
-TRIBE v2, a multimodal brain encoding model. You reason about which brain \
-regions (language, attention, visual) each edit targets. You learn from past \
-actions — if an action hurt performance, avoid similar actions. \
+propose precise text and copy edits to maximize predicted brain activation as \
+measured by TRIBE v2, a multimodal brain encoding model. You reason about which \
+brain regions (FFA, V4, MT+, Hippocampus, PFC, ACC, Amygdala, Insula, NAcc) each \
+edit targets. You learn from past actions — if an action hurt performance, avoid \
+similar actions. You respect ethical guardrails: never propose edits that would \
+raise Amygdala above 0.60 or NAcc above 0.70 outside gamification intent. \
 Propose ONE specific edit as JSON.\
 """
 
@@ -42,11 +48,11 @@ def _build_system_prompt(
     memory: Optional["ExperienceBuffer"],
     action_type: str,
     gaze_regions: Optional[list] = None,
+    brain_scores: Optional[dict] = None,
+    ethics_flags: Optional[list] = None,
+    intent: str = "engage",
 ) -> str:
-    if memory is None and not gaze_regions:
-        return _BASE_SYSTEM
-
-    extra = ""
+    extra = f"\n\nOptimization intent: {intent}"
 
     if memory is not None:
         stats = memory.get_action_stats()
@@ -75,6 +81,19 @@ def _build_system_prompt(
             extra += f"\n\nRecent failures for '{action_type}' to avoid repeating:\n"
             extra += "\n".join(failure_lines)
 
+    if brain_scores:
+        region_lines = "\n".join(
+            f"  {r}: {s:.3f}" for r, s in sorted(brain_scores.items(), key=lambda x: -x[1])
+        )
+        extra += "\n\nBrain region activations (9 HCP-MMP1 regions, stub encoder):\n" + region_lines
+
+    if ethics_flags:
+        flag_lines = "\n".join(
+            f"  [{f['severity'].upper()}] {f['code']}: {f['message']}"
+            for f in ethics_flags
+        )
+        extra += "\n\n⚠ Ethics flags — do NOT propose edits that worsen these:\n" + flag_lines
+
     if gaze_regions:
         gaze_lines = "\n".join(
             f"  #{r['rank']} saliency={r['saliency_score']:.2f}  "
@@ -84,9 +103,7 @@ def _build_system_prompt(
         extra += (
             "\n\nGaze analysis — predicted human fixation map (rank 1 = most attended):\n"
             + gaze_lines
-            + "\n\nPRIORITY: target the content in the rank-1 salient region first. "
-            "This region receives the most eye attention and therefore has the "
-            "highest impact on predicted neural engagement."
+            + "\n\nPRIORITY: target the content in the rank-1 salient region first."
         )
 
     return _BASE_SYSTEM + extra
@@ -94,7 +111,7 @@ def _build_system_prompt(
 
 class OptimizationAgent:
     def __init__(self, memory: Optional["ExperienceBuffer"] = None) -> None:
-        self.live = os.getenv("OPENAI_LIVE", "false").lower() == "true"
+        self.live = os.getenv("CLAUDE_LIVE", "false").lower() == "true"
         self._action_index = 0
         self._memory = memory
 
@@ -110,6 +127,9 @@ class OptimizationAgent:
         iteration: int,
         screenshot_path: Optional[str] = None,
         gaze_regions: Optional[list] = None,
+        brain_scores: Optional[dict] = None,
+        ethics_flags: Optional[list] = None,
+        intent: str = "engage",
     ) -> dict:
         action_type = self._next_action_type()
 
@@ -125,6 +145,9 @@ class OptimizationAgent:
         return await self._live_select(
             screenshot_b64, page_content, score_history, action_type,
             gaze_regions=gaze_regions,
+            brain_scores=brain_scores,
+            ethics_flags=ethics_flags,
+            intent=intent,
         )
 
     async def _live_select(
@@ -134,11 +157,16 @@ class OptimizationAgent:
         score_history: list,
         action_type: str,
         gaze_regions: Optional[list] = None,
+        brain_scores: Optional[dict] = None,
+        ethics_flags: Optional[list] = None,
+        intent: str = "engage",
     ) -> dict:
-        from openai import AsyncOpenAI  # type: ignore
+        import anthropic  # type: ignore
 
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        system = _build_system_prompt(self._memory, action_type, gaze_regions)
+        client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        system = _build_system_prompt(
+            self._memory, action_type, gaze_regions, brain_scores, ethics_flags, intent
+        )
 
         current = score_history[-1] if score_history else {}
         score_lines = "\n".join(
@@ -158,7 +186,6 @@ class OptimizationAgent:
             page_content.text if hasattr(page_content, "text") else str(page_content)
         )[:2500]
 
-        # Build gaze context string for user message
         gaze_hint = ""
         if gaze_regions:
             top = gaze_regions[0]
@@ -170,8 +197,12 @@ class OptimizationAgent:
         user_parts: list = []
         if screenshot_b64:
             user_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "low"},
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": screenshot_b64,
+                },
             })
 
         user_parts.append({
@@ -197,20 +228,17 @@ class OptimizationAgent:
             ),
         })
 
-        print(f"[NeuralLens] → GPT-4.1-nano call | action={action_type} | gaze={bool(gaze_regions)}")
-        resp = await client.chat.completions.create(
-            model="gpt-4.1-nano",
+        print(f"[NeuralLens] → Claude call | action={action_type} | intent={intent} | gaze={bool(gaze_regions)}")
+        resp = await client.messages.create(
+            model="claude-sonnet-4-6",
             max_tokens=512,
-            temperature=0.7,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_parts},
-            ],
+            system=system,
+            messages=[{"role": "user", "content": user_parts}],
         )
 
         usage = resp.usage
-        print(f"[NeuralLens] ← GPT-4.1-nano reply | prompt={usage.prompt_tokens} completion={usage.completion_tokens} total={usage.total_tokens} tokens")
-        raw = resp.choices[0].message.content or ""
+        print(f"[NeuralLens] ← Claude reply | input={usage.input_tokens} output={usage.output_tokens} tokens")
+        raw = resp.content[0].text if resp.content else ""
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]

@@ -38,6 +38,7 @@ class JobState:
     status: str = "pending"
     max_iterations: int = 10
     current_iteration: int = 0
+    intent: str = "engage"
     result: Optional[dict] = None
     error: Optional[str] = None
     events: list[dict] = field(default_factory=list)
@@ -116,9 +117,17 @@ class NeuralOptimizer:
     )
     page_visualizer: PageVisualizer = field(default_factory=PageVisualizer)
 
-    async def run(self, url: str, max_iterations: int = 10, job_id: str = "") -> dict:
+    async def run(
+        self,
+        url: str,
+        max_iterations: int = 10,
+        job_id: str = "",
+        intent: str = "engage",
+    ) -> dict:
         job_id = job_id or str(uuid.uuid4())
         job = jobs.get(job_id)
+        if job:
+            job.intent = intent
         pattern_lib = get_library()
 
         work_dir = os.path.join(tempfile.gettempdir(), "neurallens", job_id)
@@ -182,11 +191,26 @@ class NeuralOptimizer:
                     min(1.0, baseline_score["overall_score"] * w), 4
                 )
 
+            # ── Brain region scoring at baseline ──────────────────────────
+            from brain_regions import evaluate_ethics, compute_intent_reward
+            baseline_brain = await self.scorer.score_brain_regions(
+                page.screenshot_path or None, text=page.text
+            )
+            current_brain = baseline_brain.copy()
+            baseline_ethics = evaluate_ethics(baseline_brain, intent)
+
             await self._emit(job, "progress", {
                 "status": "baseline",
                 "message": f"Baseline overall: {baseline_score['overall_score']:.4f}",
                 "score": baseline_score,
                 "iteration_count": 0, "max_iterations": max_iterations,
+            })
+            await self._emit(job, "brain_regions", {
+                "iteration_count": 0,
+                "regions": baseline_brain,
+                "ethics_flags": baseline_ethics,
+                "intent": intent,
+                "is_baseline": True,
             })
             if job:
                 job.current_iteration = 0
@@ -243,11 +267,15 @@ class NeuralOptimizer:
                     "action_type": action_type,
                 })
 
+                current_ethics = evaluate_ethics(current_brain, intent)
                 score_history = [baseline_score] + [h["score"] for h in history]
                 edit = await self.agent.select_action(
                     page, score_history, step,
                     screenshot_path=current_screenshot_path,
                     gaze_regions=gaze_regions or None,
+                    brain_scores=current_brain,
+                    ethics_flags=current_ethics,
+                    intent=intent,
                 )
                 episode_tried.append(edit.get("action_type", action_type))
 
@@ -286,6 +314,13 @@ class NeuralOptimizer:
                     screenshot_path=current_screenshot_path,
                 )
                 annotated_b64 = await annot_task
+
+                # Brain region scoring on current screenshot (fast local stub)
+                new_brain = await self.scorer.score_brain_regions(
+                    current_screenshot_path or None, text=updated_text
+                )
+                step_ethics = evaluate_ethics(new_brain, intent, prev_scores=current_brain)
+                intent_reward = compute_intent_reward(new_brain, current_brain, intent)
 
                 score_delta = new_score["overall_score"] - current_score["overall_score"]
                 roi_deltas = {
@@ -327,6 +362,7 @@ class NeuralOptimizer:
                 if accepted:
                     current_score = new_score
                     current_text = updated_text
+                    current_brain = new_brain
                     accepted_edits.append(edit)
                     accepted_comp_ids.append(target_id)
                     # Fire background re-render + gaze re-sample (non-blocking)
@@ -382,6 +418,7 @@ class NeuralOptimizer:
                     "iteration_count": step, "max_iterations": max_iterations,
                     "edit": edit, "reward": score_delta,
                     "shaped_reward": shaped,
+                    "intent_reward": intent_reward,
                     "score": new_score, "accepted": accepted,
                     "roi_deltas": roi_deltas, "strategy": strategy,
                     "annotated_screenshot_base64": annotated_b64,
@@ -389,6 +426,14 @@ class NeuralOptimizer:
                     "viz_components": [dict(vc) for vc in viz_components],
                     "gaze_regions": gaze_regions,
                     "memory_count": memory_count,
+                })
+                await self._emit(job, "brain_regions", {
+                    "iteration_count": step,
+                    "regions": new_brain,
+                    "ethics_flags": step_ethics,
+                    "intent": intent,
+                    "intent_reward": intent_reward,
+                    "accepted": accepted,
                 })
 
             # ── 4. Render optimized screenshot ────────────────────────────
@@ -408,12 +453,14 @@ class NeuralOptimizer:
             fv = current_score["overall_score"]
             improvement_pct = ((fv - bv) / max(bv, 1e-6)) * 100 if bv > 0 else 0.0
 
+            final_ethics = evaluate_ethics(current_brain, intent)
             result = {
                 "job_id": job_id, "url": url,
                 "baseline_score": baseline_score,
                 "final_score": current_score,
                 "improvement_pct": round(improvement_pct, 2),
                 "iterations": max_iterations,
+                "intent": intent,
                 "history": history,
                 "accepted_edits": accepted_edits,
                 "final_content": current_text,
@@ -422,6 +469,9 @@ class NeuralOptimizer:
                 "discovered_patterns": get_library().get_experience_count(),
                 "gaze_regions": gaze_regions,
                 "gaze_live": gaze_data.get("gaze_live", False),
+                "baseline_brain_regions": baseline_brain,
+                "final_brain_regions": current_brain,
+                "ethics_flags": final_ethics,
             }
 
             if job:
