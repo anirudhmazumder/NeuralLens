@@ -17,6 +17,8 @@ from typing import Optional
 class TribeScorer:
     def __init__(self) -> None:
         self.endpoint = os.getenv("TRIBE_ENDPOINT", "http://localhost:9090/encode")
+        # Free tunnels / cold model starts can exceed 30s, so make timeout configurable.
+        self.timeout_seconds = float(os.getenv("TRIBE_TIMEOUT_SECONDS", "90"))
 
     def _encode_url(self) -> str:
         ep = self.endpoint.rstrip("/")
@@ -67,7 +69,13 @@ class TribeScorer:
             png = fh.read()
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            timeout = httpx.Timeout(
+                connect=min(15.0, self.timeout_seconds),
+                read=self.timeout_seconds,
+                write=min(30.0, self.timeout_seconds),
+                pool=min(15.0, self.timeout_seconds),
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 # Try raw PNG body first (Flask request.data style).
                 r = await client.post(url, content=png, headers={"Content-Type": "image/png"})
                 if r.status_code >= 400:
@@ -81,7 +89,10 @@ class TribeScorer:
                 return self._extract_regions(data)
 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
-            print(f"[TRIBE] endpoint unreachable ({exc.__class__.__name__}) — using local encoder")
+            print(
+                f"[TRIBE] endpoint unreachable ({exc.__class__.__name__}) "
+                f"after timeout={self.timeout_seconds:.1f}s — using local encoder"
+            )
             from brain_regions import score_screenshot
             return score_screenshot(screenshot_path)
 

@@ -17,6 +17,9 @@ export default defineConfig({
       '/apply-edit': 'http://localhost:8080',
       '/export': 'http://localhost:8080',
       '/gaze-analysis': 'http://localhost:8080',
+      '/upload-html': 'http://localhost:8080',
+      '/optimize-html': 'http://localhost:8080',
+      '/html-job': 'http://localhost:8080',
     },
   },
 })

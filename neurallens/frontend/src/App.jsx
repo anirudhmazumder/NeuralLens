@@ -32,7 +32,12 @@ const STATUS_MESSAGES = {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('optimize')  // 'optimize' | 'build' | 'patterns'
+  const [inputMode, setInputMode] = useState('url')       // 'url' | 'file'
   const [url, setUrl] = useState('')
+  const [uploadedHtml, setUploadedHtml] = useState(null)  // { content, filename, screenshot, score, gaze }
+  const [isDragging, setIsDragging] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [htmlJobId, setHtmlJobId] = useState(null)
   const [maxIter, setMaxIter] = useState(10)
   const [status, setStatus] = useState('idle')   // idle | starting | running | complete | error
   const [feed, setFeed] = useState([])            // action feed items
@@ -147,7 +152,41 @@ export default function App() {
     }
   }, [])
 
+  const handleFileUpload = async (file) => {
+    if (!file || !file.name.endsWith('.html')) {
+      setError('Please upload a .html file')
+      return
+    }
+    setUploading(true)
+    setError(null)
+    setUploadedHtml(null)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await fetch(`${API}/upload-html`, { method: 'POST', body: form })
+      if (!res.ok) throw new Error(`Upload failed: HTTP ${res.status}`)
+      const data = await res.json()
+      setUploadedHtml(data)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const handleDrop = (e) => {
+    e.preventDefault()
+    setIsDragging(false)
+    const file = e.dataTransfer.files[0]
+    if (file) handleFileUpload(file)
+  }
+
   const startOptimization = async () => {
+    if (inputMode === 'file') {
+      if (!uploadedHtml) return
+      await startHtmlOptimization()
+      return
+    }
     if (!url.trim()) return
     esRef.current?.close()
 
@@ -193,6 +232,67 @@ export default function App() {
       setError(err.message)
       setStatus('idle')
     }
+  }
+
+  const startHtmlOptimization = async () => {
+    esRef.current?.close()
+    setError(null)
+    setStatus('starting')
+    setFeed([])
+    setChartData([])
+    setEvents([])
+    setCurrentIter(0)
+    setMaxIterations(maxIter)
+    setBaselineScore(null)
+    setFinalScore(null)
+    setAcceptedEdits([])
+    setJobIdForPreview(null)
+    setHtmlJobId(null)
+
+    try {
+      const res = await fetch(`${API}/optimize-html`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          html_content: uploadedHtml.html_content,
+          filename: uploadedHtml.filename,
+          max_iterations: maxIter,
+        }),
+      })
+      if (!res.ok) throw new Error(`Server error: HTTP ${res.status}`)
+      const { job_id } = await res.json()
+
+      setHtmlJobId(job_id)
+      setStatus('running')
+      const es = new EventSource(`${API}/job/${job_id}/stream`)
+      esRef.current = es
+
+      es.onmessage = (e) => {
+        const { type, data } = JSON.parse(e.data)
+        handleEvent(type, data)
+        if (type === 'complete') setJobIdForPreview(job_id)
+      }
+      es.onerror = () => {
+        setStatus('error')
+        setError('Connection to server lost. Is the backend running?')
+        es.close()
+      }
+    } catch (err) {
+      setError(err.message)
+      setStatus('idle')
+    }
+  }
+
+  const downloadOptimizedHtml = () => {
+    if (!htmlJobId) return
+    const a = document.createElement('a')
+    a.href = `${API}/html-job/${htmlJobId}/download`
+    a.download = uploadedHtml
+      ? `${uploadedHtml.filename.replace('.html', '')}_neurallens.html`
+      : 'optimized_neurallens.html'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
   }
 
   const progress = maxIterations > 0 ? (currentIter / maxIterations) * 100 : 0
@@ -287,17 +387,25 @@ export default function App() {
       {/* ── Optimize tab — Agent Vision mode ── */}
       {activeTab === 'optimize' && agentVisionActive && (
         <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-          {/* Compact URL bar at top when vision is active */}
+          {/* Compact bar at top when vision is active */}
           <div className="flex items-center gap-3 px-4 py-2.5 border-b border-gray-800 flex-shrink-0 bg-gray-950/80">
-            <input
-              type="url"
-              value={url}
-              onChange={e => setUrl(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && !isRunning && startOptimization()}
-              placeholder="https://example.com"
-              disabled={isRunning}
-              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 transition"
-            />
+            {inputMode === 'url' ? (
+              <input
+                type="url"
+                value={url}
+                onChange={e => setUrl(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !isRunning && startOptimization()}
+                placeholder="https://example.com"
+                disabled={isRunning}
+                className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 transition"
+              />
+            ) : (
+              <span className={`flex-1 text-xs px-3 py-1.5 rounded-lg border truncate ${
+                uploadedHtml ? 'border-green-700/60 text-green-300 bg-green-950/20' : 'border-gray-700 text-gray-500'
+              }`}>
+                {uploadedHtml ? `📄 ${uploadedHtml.filename}` : 'No HTML file uploaded'}
+              </span>
+            )}
             <div className="flex items-center gap-2 flex-shrink-0">
               <span className="text-xs text-gray-500">Iters:</span>
               <input
@@ -311,10 +419,11 @@ export default function App() {
             </div>
             <button
               onClick={startOptimization}
-              disabled={!url.trim() || isRunning}
+              disabled={(inputMode === 'url' ? !url.trim() : !uploadedHtml) || isRunning}
               className="bg-violet-600 hover:bg-violet-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-semibold py-1.5 px-4 rounded-lg text-sm transition cursor-pointer disabled:cursor-not-allowed flex-shrink-0"
             >
-              {status === 'starting' ? 'Starting…' : isRunning ? 'Running…' : '⚡ Optimize'}
+              {status === 'starting' ? 'Starting…' : isRunning ? 'Running…'
+                : inputMode === 'file' ? '⚡ Optimize HTML' : '⚡ Optimize'}
             </button>
             {error && (
               <div className="text-xs text-red-400 truncate max-w-xs">{error}</div>
@@ -341,21 +450,90 @@ export default function App() {
       <div className="flex flex-1 min-h-0">
         {/* ── Left panel ── */}
         <div className="w-[40%] border-r border-gray-800 flex flex-col p-5 gap-4 min-h-0">
-          {/* URL input */}
+          {/* Input mode toggle + inputs */}
           <div className="flex flex-col gap-2.5 flex-shrink-0">
-            <label className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
-              Target URL
-            </label>
-            <input
-              type="url"
-              value={url}
-              onChange={e => setUrl(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && !isRunning && startOptimization()}
-              placeholder="https://example.com"
-              disabled={isRunning}
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3.5 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 transition"
-            />
-            <div className="flex gap-2 items-center">
+            {/* Mode toggle */}
+            <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs w-fit">
+              {[['url', '🔗 URL'], ['file', '📄 HTML File']].map(([mode, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => { setInputMode(mode); setError(null) }}
+                  disabled={isRunning}
+                  className={`px-3 py-1.5 font-medium transition cursor-pointer disabled:cursor-not-allowed ${
+                    inputMode === mode
+                      ? 'bg-violet-600 text-white'
+                      : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {inputMode === 'url' ? (
+              <input
+                type="url"
+                value={url}
+                onChange={e => setUrl(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !isRunning && startOptimization()}
+                placeholder="https://example.com"
+                disabled={isRunning}
+                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3.5 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 transition"
+              />
+            ) : (
+              /* File upload zone */
+              <div
+                onDragOver={e => { e.preventDefault(); setIsDragging(true) }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={handleDrop}
+                className={`relative flex flex-col items-center justify-center gap-2 border-2 border-dashed rounded-xl px-4 py-5 text-center transition cursor-pointer ${
+                  isDragging
+                    ? 'border-violet-500 bg-violet-950/30'
+                    : uploadedHtml
+                    ? 'border-green-700/60 bg-green-950/20'
+                    : 'border-gray-700 hover:border-gray-500 bg-gray-900/40'
+                }`}
+                onClick={() => {
+                  const inp = document.createElement('input')
+                  inp.type = 'file'
+                  inp.accept = '.html'
+                  inp.onchange = e => e.target.files[0] && handleFileUpload(e.target.files[0])
+                  inp.click()
+                }}
+              >
+                {uploading ? (
+                  <span className="text-xs text-gray-400 flex items-center gap-2">
+                    <span className="animate-spin">⟳</span> Rendering HTML…
+                  </span>
+                ) : uploadedHtml ? (
+                  <>
+                    <span className="text-green-400 text-lg">✓</span>
+                    <span className="text-xs text-green-300 font-medium">{uploadedHtml.filename}</span>
+                    <span className="text-[10px] text-gray-500">
+                      Baseline: {uploadedHtml.page_score?.overall_score?.toFixed(4) ?? '—'}
+                    </span>
+                    {uploadedHtml.screenshot_base64 && (
+                      <img
+                        src={`data:image/png;base64,${uploadedHtml.screenshot_base64}`}
+                        alt="Uploaded page preview"
+                        className="mt-1 w-full rounded border border-gray-700/50 object-cover max-h-28"
+                      />
+                    )}
+                    <span className="text-[10px] text-gray-600 mt-1">Click to replace</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-2xl">📄</span>
+                    <span className="text-xs text-gray-400 font-medium">
+                      Drop your <span className="text-violet-400">.html</span> file here
+                    </span>
+                    <span className="text-[10px] text-gray-600">or click to browse</span>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-2 items-center flex-wrap">
               <div className="flex items-center gap-2">
                 <span className="text-xs text-gray-500 whitespace-nowrap">Iterations:</span>
                 <input
@@ -368,27 +546,30 @@ export default function App() {
                   className="w-14 bg-gray-900 border border-gray-700 rounded px-2 py-2 text-sm text-white text-center focus:outline-none focus:border-violet-500 disabled:opacity-50"
                 />
               </div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-500 whitespace-nowrap">Intent:</span>
-                <select
-                  value={intent}
-                  onChange={e => setIntent(e.target.value)}
-                  disabled={isRunning}
-                  className="bg-gray-900 border border-gray-700 rounded px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 disabled:opacity-50 cursor-pointer"
-                >
-                  <option value="engage">Engage</option>
-                  <option value="trust">Trust</option>
-                  <option value="convert">Convert</option>
-                  <option value="accessibility">Accessibility</option>
-                  <option value="gamification">Gamification</option>
-                </select>
-              </div>
+              {inputMode === 'url' && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500 whitespace-nowrap">Intent:</span>
+                  <select
+                    value={intent}
+                    onChange={e => setIntent(e.target.value)}
+                    disabled={isRunning}
+                    className="bg-gray-900 border border-gray-700 rounded px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 disabled:opacity-50 cursor-pointer"
+                  >
+                    <option value="engage">Engage</option>
+                    <option value="trust">Trust</option>
+                    <option value="convert">Convert</option>
+                    <option value="accessibility">Accessibility</option>
+                    <option value="gamification">Gamification</option>
+                  </select>
+                </div>
+              )}
               <button
                 onClick={startOptimization}
-                disabled={!url.trim() || isRunning}
+                disabled={(inputMode === 'url' ? !url.trim() : !uploadedHtml) || isRunning}
                 className="flex-1 bg-violet-600 hover:bg-violet-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-semibold py-2.5 px-4 rounded-lg text-sm transition cursor-pointer disabled:cursor-not-allowed"
               >
-                {status === 'starting' ? 'Starting…' : isRunning ? 'Running…' : '⚡ Optimize'}
+                {status === 'starting' ? 'Starting…' : isRunning ? 'Running…'
+                  : inputMode === 'file' ? '⚡ Optimize HTML' : '⚡ Optimize'}
               </button>
             </div>
 
@@ -423,7 +604,9 @@ export default function App() {
             <div ref={feedRef} className="flex-1 overflow-y-auto flex flex-col gap-2 pr-1">
               {feed.length === 0 && status === 'idle' && (
                 <div className="text-xs text-gray-600 italic text-center mt-10 px-4">
-                  Enter a URL and click Optimize to begin neural analysis
+                  {inputMode === 'file'
+                    ? 'Upload an HTML file and click Optimize HTML to begin'
+                    : 'Enter a URL and click Optimize to begin neural analysis'}
                 </div>
               )}
               {feed.map((item, idx) => (
@@ -506,6 +689,24 @@ export default function App() {
               iterations={maxIterations}
               accepted={acceptedEdits.length}
             />
+          )}
+
+          {/* Download optimized HTML — only shown after an HTML file job completes */}
+          {status === 'complete' && inputMode === 'file' && htmlJobId && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex-shrink-0 flex items-center gap-4">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs font-semibold text-gray-300">Optimized HTML ready</div>
+                <div className="text-[10px] text-gray-500 mt-0.5 truncate">
+                  {uploadedHtml?.filename ?? 'upload.html'} — design improvements applied
+                </div>
+              </div>
+              <button
+                onClick={downloadOptimizedHtml}
+                className="flex-shrink-0 flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white font-semibold py-2 px-4 rounded-lg text-sm transition cursor-pointer"
+              >
+                ⬇ Download
+              </button>
+            </div>
           )}
 
           {/* Before / After page preview */}

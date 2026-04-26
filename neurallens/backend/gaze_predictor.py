@@ -23,6 +23,10 @@ import numpy as np
 
 _CENTERBIAS_PATH = os.getenv("CENTERBIAS_PATH", "/workspace/centerbias_mit1003.npy")
 _GAZE_DEVICE = os.getenv("GAZE_DEVICE", "cpu")
+_MODEL_CACHE_PATH = Path(os.getenv(
+    "DEEPGAZE_CACHE_PATH",
+    os.path.expanduser("~/.cache/neurallens/deepgaze_iie.pth"),
+))
 
 
 @dataclass
@@ -94,9 +98,23 @@ class GazePredictor:
         try:
             import torch
             from deepgaze_pytorch import DeepGazeIIE  # type: ignore[import-untyped]
-            self._model = DeepGazeIIE(pretrained=True).to(_GAZE_DEVICE)
+
+            if _MODEL_CACHE_PATH.exists():
+                # Load from local cache — no internet call on subsequent starts
+                model = DeepGazeIIE(pretrained=False)
+                model.load_state_dict(
+                    torch.load(str(_MODEL_CACHE_PATH), map_location=_GAZE_DEVICE)
+                )
+                print(f"[GazePredictor] DeepGaze IIE loaded from cache: {_MODEL_CACHE_PATH}")
+            else:
+                # First run: download once, then save for future starts
+                model = DeepGazeIIE(pretrained=True)
+                _MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), str(_MODEL_CACHE_PATH))
+                print(f"[GazePredictor] DeepGaze IIE downloaded and cached to {_MODEL_CACHE_PATH}")
+
+            self._model = model.to(_GAZE_DEVICE)
             self._model.eval()
-            print(f"[GazePredictor] DeepGaze IIE loaded on {_GAZE_DEVICE}")
         except (RuntimeError, OSError, Exception) as exc:
             # Corrupted checkpoint, missing file, or other load failure — fall back to stub
             print(f"[GazePredictor] model load failed ({exc.__class__.__name__}: {exc}) — using F-pattern stub")

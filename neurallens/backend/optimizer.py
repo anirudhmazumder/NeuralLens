@@ -539,6 +539,244 @@ async def _resample_page(
         return None
 
 
+# ── HTML file optimizer ───────────────────────────────────────────────────────
+
+@dataclass
+class HtmlOptimizationLoop:
+    """RL-style optimizer that works on an uploaded HTML string instead of a URL.
+
+    Each iteration:
+      1. Re-renders current HTML via Playwright (file://)
+      2. Takes a screenshot and runs gaze analysis
+      3. Asks the agent to propose one HTML/CSS design edit
+      4. Applies the edit as a string replacement in the HTML source
+      5. Re-scores with TRIBE and accepts/rejects based on overall_score delta
+      6. Emits SSE events in the same format as NeuralOptimizer (reuses the stream)
+    """
+    scorer: TribeScorer = field(default_factory=TribeScorer)
+    agent: OptimizationAgent = field(
+        default_factory=lambda: OptimizationAgent(memory=get_buffer())
+    )
+
+    async def run(
+        self,
+        html_content: str,
+        max_iterations: int = 10,
+        job_id: str = "",
+        filename: str = "upload.html",
+    ) -> dict:
+        job_id = job_id or str(uuid.uuid4())
+        job = jobs.get(job_id)
+
+        work_dir = os.path.join(tempfile.gettempdir(), "neurallens_html", job_id)
+        os.makedirs(work_dir, exist_ok=True)
+
+        try:
+            from scraper import render_html_file
+            from gaze_predictor import get_gaze_predictor
+
+            # ── 1. Initial render ─────────────────────────────────────────
+            await self._emit(job, "progress", {
+                "status": "scraping",
+                "message": f"Rendering uploaded HTML file '{filename}'…",
+                "iteration_count": 0, "max_iterations": max_iterations,
+            })
+            page = await render_html_file(html_content, work_dir)
+            before_screenshot = page.screenshot_path
+
+            # ── 2. Gaze analysis ──────────────────────────────────────────
+            await self._emit(job, "progress", {
+                "status": "gaze_analysis",
+                "message": "Predicting gaze patterns on uploaded page…",
+                "iteration_count": 0, "max_iterations": max_iterations,
+            })
+            gaze_data = await get_gaze_predictor().analyze(page.screenshot_path)
+            gaze_regions = gaze_data["regions"]
+
+            await self._emit(job, "gaze", {
+                "status": "gaze_complete",
+                "message": (
+                    f"Gaze: {len(gaze_regions)} salient regions mapped"
+                    f" ({'live DeepGaze IIE' if gaze_data.get('gaze_live') else 'F-pattern stub'})"
+                ),
+                "gaze_regions": gaze_regions,
+                "gaze_live": gaze_data.get("gaze_live", False),
+            })
+
+            # ── 3. Baseline ───────────────────────────────────────────────
+            await self._emit(job, "progress", {
+                "status": "scoring",
+                "message": "Computing baseline neural activation…",
+                "iteration_count": 0, "max_iterations": max_iterations,
+            })
+            baseline_score = await self.scorer.score(
+                page.video_path, page.text, page.audio_path,
+                screenshot_path=page.screenshot_path,
+            )
+            current_score = baseline_score.copy()
+            current_html = html_content
+            current_screenshot = page.screenshot_path
+            history: list[dict] = []
+            accepted_edits: list[dict] = []
+
+            await self._emit(job, "progress", {
+                "status": "baseline",
+                "message": f"Baseline overall: {baseline_score['overall_score']:.4f}",
+                "score": baseline_score,
+                "iteration_count": 0, "max_iterations": max_iterations,
+            })
+
+            # ── 4. RL episode ─────────────────────────────────────────────
+            for step in range(1, max_iterations + 1):
+                await self._emit(job, "progress", {
+                    "status": "proposing",
+                    "message": f"[{step}/{max_iterations}] Agent proposing HTML design edit…",
+                    "iteration_count": step, "max_iterations": max_iterations,
+                    "action_type": "html_design",
+                })
+
+                score_history = [baseline_score] + [h["score"] for h in history]
+                brain_scores = current_score.get("atlas_regions")
+
+                edit = await self.agent.select_html_action(
+                    current_html,
+                    score_history,
+                    step,
+                    screenshot_path=current_screenshot,
+                    gaze_regions=gaze_regions or None,
+                    brain_scores=brain_scores,
+                )
+
+                # Apply HTML edit
+                html_orig = edit.get("html_original", "")
+                html_repl = edit.get("html_replacement", "")
+                updated_html = current_html
+                applied = False
+                if html_orig and html_orig in current_html:
+                    updated_html = current_html.replace(html_orig, html_repl, 1)
+                    applied = True
+
+                await self._emit(job, "progress", {
+                    "status": "scoring",
+                    "message": f"[{step}/{max_iterations}] Re-rendering and scoring…",
+                    "iteration_count": step, "max_iterations": max_iterations,
+                })
+
+                # Re-render and re-screenshot if the edit was applied
+                step_screenshot = current_screenshot
+                if applied:
+                    step_dir = os.path.join(work_dir, f"step_{step}")
+                    os.makedirs(step_dir, exist_ok=True)
+                    step_page = await render_html_file(updated_html, step_dir)
+                    step_screenshot = step_page.screenshot_path
+                    # Re-run gaze on the updated page
+                    new_gaze = await get_gaze_predictor().analyze(step_screenshot)
+                    if new_gaze["regions"]:
+                        gaze_regions = new_gaze["regions"]
+
+                new_score = await self.scorer.score(
+                    page.video_path,
+                    page.text,
+                    page.audio_path,
+                    screenshot_path=step_screenshot,
+                )
+
+                score_delta = new_score["overall_score"] - current_score["overall_score"]
+                accepted = score_delta > 0
+
+                if accepted:
+                    current_score = new_score
+                    current_html = updated_html
+                    current_screenshot = step_screenshot
+                    accepted_edits.append(edit)
+
+                entry = {
+                    "iteration": step,
+                    "action": edit,
+                    "reward": round(score_delta, 4),
+                    "score": new_score,
+                    "accepted": accepted,
+                    "applied": applied,
+                }
+                history.append(entry)
+
+                agent_thought = {
+                    "step": "accepted" if accepted else "rejected",
+                    "action_type": edit.get("action_type", "html_design"),
+                    "target": edit.get("target", ""),
+                    "reasoning": edit.get("reasoning", ""),
+                    "original": edit.get("html_original", "")[:150],
+                    "replacement": edit.get("html_replacement", "")[:150],
+                    "expected_roi_impact": edit.get("expected_roi_impact", {}),
+                    "score_delta": round(score_delta, 4),
+                    "new_score": round(new_score["overall_score"], 4),
+                }
+
+                await self._emit(job, "progress", {
+                    "status": "iteration_complete",
+                    "message": (
+                        f"[{step}/{max_iterations}] "
+                        f"{'✓ Accepted' if accepted else '✗ Rejected'} "
+                        f"({score_delta:+.4f})"
+                    ),
+                    "iteration_count": step, "max_iterations": max_iterations,
+                    "edit": {
+                        **edit,
+                        "original": edit.get("html_original", ""),
+                        "replacement": edit.get("html_replacement", ""),
+                    },
+                    "reward": score_delta,
+                    "score": new_score,
+                    "accepted": accepted,
+                    "gaze_regions": gaze_regions,
+                    "agent_thought": agent_thought,
+                })
+
+            # ── 5. Build result ───────────────────────────────────────────
+            bv = baseline_score["overall_score"]
+            fv = current_score["overall_score"]
+            improvement_pct = ((fv - bv) / max(bv, 1e-6)) * 100 if bv > 0 else 0.0
+
+            result = {
+                "job_id": job_id,
+                "filename": filename,
+                "baseline_score": baseline_score,
+                "final_score": current_score,
+                "improvement_pct": round(improvement_pct, 2),
+                "iterations": max_iterations,
+                "history": history,
+                "accepted_edits": accepted_edits,
+                "before_screenshot": before_screenshot,
+                "after_screenshot": current_screenshot,
+                "optimized_html": current_html,
+                "gaze_regions": gaze_regions,
+                "gaze_live": gaze_data.get("gaze_live", False),
+            }
+
+            if job:
+                job.status = "complete"
+                job.result = result
+
+            await self._emit(job, "complete", result)
+            return result
+
+        except Exception as exc:
+            msg = str(exc)
+            if job:
+                job.status = "error"
+                job.error = msg
+            await self._emit(job, "error", {"message": msg})
+            raise
+
+    @staticmethod
+    async def _emit(job: Optional[JobState], event_type: str, data: dict) -> None:
+        if job is None:
+            return
+        event = {"type": event_type, "data": data}
+        job.events.append(event)
+        await job.event_queue.put(event)
+
+
 async def _render_optimized_screenshot(
     url: str, accepted_edits: list, out_dir: str, suffix: str = ""
 ) -> str:

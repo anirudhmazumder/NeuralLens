@@ -489,3 +489,228 @@ class OptimizationAgent:
             "expected_roi_impact": {"language": 0.0, "attention": 0.0, "visual": 0.0},
             "expected_roi": "language_roi",
         }
+
+    async def select_html_action(
+        self,
+        html_content: str,
+        score_history: list,
+        iteration: int,
+        screenshot_path: Optional[str] = None,
+        gaze_regions: Optional[list] = None,
+        brain_scores: Optional[dict] = None,
+    ) -> dict:
+        """Propose an HTML/CSS design edit to improve neural engagement.
+
+        Unlike select_action (which targets copywriting), this method asks the
+        model to make visual design changes: colors, typography, spacing, CTA
+        prominence, layout — returning html_original / html_replacement pairs
+        that are applied as string replacements directly in the HTML source.
+        """
+        if not self._live:
+            return _fake_html_edit(iteration, html_content)
+
+        screenshot_b64 = ""
+        if screenshot_path and Path(screenshot_path).exists():
+            with open(screenshot_path, "rb") as fh:
+                screenshot_b64 = base64.b64encode(fh.read()).decode()
+
+        return await self._call_openai_html(
+            html_content, screenshot_b64, score_history, iteration,
+            gaze_regions=gaze_regions,
+            brain_scores=brain_scores,
+        )
+
+    async def _call_openai_html(
+        self,
+        html_content: str,
+        screenshot_b64: str,
+        score_history: list,
+        iteration: int,
+        gaze_regions: Optional[list] = None,
+        brain_scores: Optional[dict] = None,
+    ) -> dict:
+        import openai  # type: ignore
+
+        client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        current = score_history[-1] if score_history else {}
+        score_block = "\n".join(
+            f"  {k}: {v:.4f}"
+            for k, v in current.items()
+            if k.endswith("_roi") or k == "overall_score"
+        )
+
+        nes_block = ""
+        brain_block = ""
+        if brain_scores:
+            from nes import nes_summary
+            ns = nes_summary(brain_scores, "engage")
+            violations_str = "  ".join(
+                f"{r} +{v:.3f}" for r, v in ns.get("violations", {}).items()
+            ) or "none"
+            nes_block = (
+                f"\nNES score: {ns['nes_score']:.4f}  Active violations: {violations_str}"
+            )
+            region_lines = "\n".join(
+                f"  {r}: {v:.4f}" for r, v in sorted(brain_scores.items(), key=lambda x: -x[1])
+            )
+            brain_block = f"\nAll TRIBE region activations:\n{region_lines}"
+
+        gaze_block = ""
+        if gaze_regions:
+            top = gaze_regions[0]
+            gaze_lines = "\n".join(
+                f"  #{r['rank']} saliency={r['saliency_score']:.2f}  bbox={r['bbox']}"
+                for r in gaze_regions[:5]
+            )
+            gaze_block = (
+                f"\nGaze map (rank-1 = most viewed):\n{gaze_lines}\n"
+                f"Focus visual design changes near peak {top['peak_coords']}."
+            )
+
+        html_excerpt = html_content[:8000]
+        action_idx = (iteration - 1) % len(HTML_ACTION_TYPES)
+        suggested_action = HTML_ACTION_TYPES[action_idx]
+
+        user_parts: list = []
+        if screenshot_b64:
+            user_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{screenshot_b64}",
+                    "detail": "high",
+                },
+            })
+
+        user_text = (
+            f"Iteration: {iteration}\n"
+            f"Suggested action_type: '{suggested_action}' — choose freely if another is more impactful.\n"
+            f"\n--- Current TRIBE scores ---\n{score_block}"
+            f"{nes_block}"
+            f"{brain_block}"
+            f"{gaze_block}"
+            f"\n\n--- Full HTML source (make your edit here) ---\n{html_excerpt}"
+            "\n\nTASK: Propose ONE visual design edit to improve neural engagement.\n"
+            "Rules:\n"
+            "  1. html_original must be an EXACT substring of the HTML above (copy-paste it).\n"
+            "  2. html_replacement is your improved version of that exact substring.\n"
+            "  3. Only change CSS properties or HTML structure — do NOT alter visible text content.\n"
+            "  4. Focus on: button colors, font sizes, contrast, whitespace, CTA prominence, "
+            "background colors, border-radius, box-shadow, font-weight, padding, layout order.\n"
+            "  5. Keep changes minimal and targeted — one element at a time.\n"
+            "Output ONE JSON object. No markdown fences:\n"
+            "{\n"
+            '  "action_type": "<from the HTML_ACTION_TYPES list>",\n'
+            '  "target": "<element description: \'primary CTA button\', \'hero section\', etc.>",\n'
+            '  "html_original": "<exact substring from the HTML above>",\n'
+            '  "html_replacement": "<your improved version>",\n'
+            '  "reasoning": "<which brain region this targets, how the change improves engagement>",\n'
+            '  "expected_roi_impact": {"language": 0.0, "attention": 0.0, "visual": 0.0}\n'
+            "}"
+        )
+
+        user_parts.append({"type": "text", "text": user_text})
+
+        print(
+            f"[NeuralLens HTML] → OpenAI | iter={iteration} | suggested={suggested_action} "
+            f"| html={len(html_excerpt)}chars | gaze={bool(gaze_regions)}"
+        )
+
+        resp = await client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-nano"),
+            max_tokens=1200,
+            messages=[
+                {"role": "system", "content": _HTML_SYSTEM},
+                {"role": "user",   "content": user_parts},
+            ],
+        )
+
+        usage = resp.usage
+        print(
+            f"[NeuralLens HTML] ← OpenAI | "
+            f"in={usage.prompt_tokens} out={usage.completion_tokens} tokens"
+        )
+
+        raw = (resp.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+
+        start, end = raw.find("{"), raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                result = json.loads(raw[start:end])
+                if "expected_roi_impact" not in result:
+                    result["expected_roi_impact"] = {"language": 0.0, "attention": 0.0, "visual": 0.0}
+                return result
+            except json.JSONDecodeError:
+                pass
+
+        print("[NeuralLens HTML] ✗ JSON parse failed — returning no-op")
+        return _fake_html_edit(iteration, html_content)
+
+
+# ── HTML system prompt ─────────────────────────────────────────────────────────
+
+_HTML_SYSTEM = """\
+You are NeuralLens HTML Designer, an expert in neuromarketing and visual design.
+You analyze uploaded HTML pages and propose precise CSS/HTML edits to maximize
+predicted neural engagement as measured by TRIBE v2 brain region activations.
+
+You target the VISUAL brain regions primarily:
+  V4  (color & form) — improved by: vivid colors, strong contrast, clear visual hierarchy,
+       deliberate whitespace, consistent color palette with one dominant accent color
+  FFA (face/identity) — improved by: prominent human imagery cues, personalized sections
+  NAcc (reward anticipation) — improved by: prominent CTAs, clear benefit visibility,
+       high-contrast buttons, visual emphasis on the offer
+
+Design principles you follow:
+  • CTAs: high-contrast background (#7c3aed violet or bold accent), adequate padding,
+    border-radius 6-10px, font-weight 600+, box-shadow for depth
+  • Typography: body 16-18px, headings 2x+ body size, sufficient line-height (1.6+),
+    high contrast text (#111 on white or #f8f8f8 on dark)
+  • Whitespace: generous padding (2-4rem sections), breathable layout reduces Insula load
+  • Color: one dominant accent, neutral background, avoid red/orange urgency cues
+    (raises Amygdala)
+  • Visual hierarchy: most important element (headline or CTA) should be visually
+    dominant — larger, bolder, or higher contrast than everything else
+
+RULES:
+  1. html_original must be a verbatim exact copy from the provided HTML.
+  2. html_replacement is your modified version — minimal targeted change.
+  3. Do NOT change visible text content — only CSS/HTML attributes/structure.
+  4. Make one focused change per iteration.
+  5. Output valid JSON only, no markdown fences.
+"""
+
+
+# ── HTML_ACTION_TYPES list (used by HtmlOptimizationLoop) ─────────────────────
+
+HTML_ACTION_TYPES = [
+    "change_button_color",
+    "increase_cta_size",
+    "improve_font_contrast",
+    "add_whitespace",
+    "change_background_color",
+    "increase_heading_size",
+    "change_font_family",
+    "improve_color_scheme",
+    "highlight_cta_section",
+    "restructure_hero_layout",
+]
+
+
+# ── Stub for HTML mode (OPENAI_LIVE=false) ────────────────────────────────────
+
+def _fake_html_edit(iteration: int, html_content: str) -> dict:
+    """Return a no-op stub edit when running without OpenAI credentials."""
+    action = HTML_ACTION_TYPES[iteration % len(HTML_ACTION_TYPES)]
+    return {
+        "action_type": action,
+        "target": "stub",
+        "html_original": "",
+        "html_replacement": "",
+        "reasoning": f"Stub mode — set OPENAI_LIVE=true to enable real HTML edits ({action})",
+        "expected_roi_impact": {"language": 0.0, "attention": 0.0, "visual": 0.0},
+    }

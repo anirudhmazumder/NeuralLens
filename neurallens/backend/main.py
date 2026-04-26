@@ -15,13 +15,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from memory import get_buffer
-from optimizer import JobState, OptimizationLoop, _infer_component_type, jobs
+from optimizer import HtmlOptimizationLoop, JobState, OptimizationLoop, _infer_component_type, jobs
 from pattern_learner import get_library
 from scorer import TribeScorer
 from stubs import ACTION_TYPES
@@ -83,6 +83,11 @@ class ExportRequest(BaseModel):
 class GazeAnalysisRequest(BaseModel):
     url: str = ""
     screenshot_path: str = ""
+
+class HtmlOptimizeRequest(BaseModel):
+    html_content: str
+    filename: str = "upload.html"
+    max_iterations: int = 10
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -527,6 +532,97 @@ def _parse_into_components(text: str) -> list[dict]:
             break
 
     return components
+
+
+# ── HTML file upload & optimization ───────────────────────────────────────────
+
+@app.post("/upload-html")
+async def upload_html(file: UploadFile = File(...)):
+    """Accept an uploaded .html file, render it, and return initial scores + screenshot."""
+    from gaze_predictor import get_gaze_predictor
+
+    raw = await file.read()
+    try:
+        html_content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        html_content = raw.decode("latin-1")
+
+    filename = file.filename or "upload.html"
+
+    work_dir = os.path.join(tempfile.gettempdir(), "neurallens_html_upload", str(uuid.uuid4()))
+    os.makedirs(work_dir, exist_ok=True)
+
+    from scraper import render_html_file
+    page = await render_html_file(html_content, work_dir)
+
+    scorer = TribeScorer()
+    page_score = await scorer.score(page.video_path, page.text, page.audio_path,
+                                    screenshot_path=page.screenshot_path)
+
+    gaze_data = await get_gaze_predictor().analyze(page.screenshot_path)
+
+    screenshot_b64 = ""
+    if page.screenshot_path and Path(page.screenshot_path).exists():
+        with open(page.screenshot_path, "rb") as fh:
+            screenshot_b64 = base64.b64encode(fh.read()).decode()
+
+    heatmap_b64 = ""
+    overlay_path = page.screenshot_path.replace(".png", "_gaze_overlay.png")
+    loop_ev = asyncio.get_event_loop()
+    from gaze_predictor import get_gaze_predictor as _gp
+    await loop_ev.run_in_executor(
+        None, _gp().generate_heatmap_overlay, page.screenshot_path, overlay_path
+    )
+    if Path(overlay_path).exists():
+        with open(overlay_path, "rb") as fh:
+            heatmap_b64 = base64.b64encode(fh.read()).decode()
+
+    return {
+        "html_content": html_content,
+        "filename": filename,
+        "screenshot_base64": screenshot_b64,
+        "heatmap_overlay_base64": heatmap_b64,
+        "page_score": page_score,
+        "salient_regions": gaze_data.get("regions", []),
+        "gaze_live": gaze_data.get("gaze_live", False),
+    }
+
+
+@app.post("/optimize-html")
+async def optimize_html(req: HtmlOptimizeRequest, background_tasks: BackgroundTasks):
+    """Start an HTML design optimization job and return a job_id for SSE streaming."""
+    job_id = str(uuid.uuid4())
+    job = JobState(job_id=job_id, url=f"[html:{req.filename}]",
+                   max_iterations=req.max_iterations, status="running")
+    jobs[job_id] = job
+
+    html_loop = HtmlOptimizationLoop()
+    background_tasks.add_task(
+        html_loop.run, req.html_content, req.max_iterations, job_id, req.filename
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/html-job/{job_id}/download")
+async def download_optimized_html(job_id: str):
+    """Return the final optimized HTML file as a downloadable attachment."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    if job.status == "error":
+        raise HTTPException(status_code=500, detail=job.error)
+    if job.status != "complete":
+        raise HTTPException(status_code=202, detail="Job still running")
+    optimized_html = job.result.get("optimized_html", "")
+    if not optimized_html:
+        raise HTTPException(status_code=404, detail="No optimized HTML in result")
+    filename = job.result.get("filename", "optimized.html")
+    stem = Path(filename).stem
+    out_name = f"{stem}_neurallens.html"
+    return HTMLResponse(
+        content=optimized_html,
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
 
 
 def _comp_type_to_action(comp_type: str) -> str:

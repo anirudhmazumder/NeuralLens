@@ -164,6 +164,111 @@ async def scrape(url: str, out_dir: str) -> PageContent:
     )
 
 
+async def render_html_file(html_content: str, out_dir: str) -> PageContent:
+    """Render an HTML string via Playwright (file://) and return PageContent.
+
+    Writes the HTML to a temp file, opens it in a headless Chromium browser,
+    takes a full-page screenshot, scrolls to record a video, and extracts
+    visible text — same output contract as scrape().
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    html_file = str(out_path / "upload.html")
+    screenshot_path = str(out_path / "screenshot.png")
+    video_path = str(out_path / "scroll_video.mp4")
+
+    Path(html_file).write_text(html_content, encoding="utf-8")
+    file_url = f"file://{html_file}"
+
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=["--no-sandbox"])
+        context = await browser.new_context(viewport={"width": 1280, "height": 800})
+        page = await context.new_page()
+
+        await page.goto(file_url, wait_until="load", timeout=15_000)
+
+        await page.screenshot(path=screenshot_path, full_page=True)
+
+        title = await page.title()
+        headings = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+                .map(h => ({tag: h.tagName.toLowerCase(), text: h.innerText.trim()}))
+                .filter(h => h.text.length > 0)
+        """)
+        cta_texts = await page.evaluate("""
+            () => Array.from(document.querySelectorAll(
+                'button,[role="button"],a.btn,.cta,input[type="submit"],input[type="button"]'
+            ))
+            .map(el => (el.innerText || el.value || '').trim())
+            .filter(t => t && t.length < 100)
+            .slice(0, 10)
+        """)
+
+        text = await page.evaluate("""
+            () => {
+                const walker = document.createTreeWalker(
+                    document.body,
+                    NodeFilter.SHOW_TEXT,
+                    {
+                        acceptNode(node) {
+                            const p = node.parentElement;
+                            if (!p) return NodeFilter.FILTER_REJECT;
+                            const s = window.getComputedStyle(p);
+                            if (s.display==='none'||s.visibility==='hidden'||s.opacity==='0')
+                                return NodeFilter.FILTER_REJECT;
+                            if (['SCRIPT','STYLE','NOSCRIPT','HEAD'].includes(p.tagName))
+                                return NodeFilter.FILTER_REJECT;
+                            const t = node.textContent.trim();
+                            return t ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                        }
+                    }
+                );
+                const parts = [];
+                let node;
+                while ((node = walker.nextNode())) {
+                    const t = node.textContent.trim();
+                    if (t) parts.push(t);
+                }
+                return parts.join('\\n');
+            }
+        """)
+
+        page_height = await page.evaluate("document.documentElement.scrollHeight")
+        viewport_h = 800
+        scroll_steps = 20
+        frames: list[Image.Image] = []
+
+        for i in range(scroll_steps):
+            frac = i / max(scroll_steps - 1, 1)
+            pos = int(frac * max(0, page_height - viewport_h))
+            await page.evaluate(f"window.scrollTo(0, {pos})")
+            await asyncio.sleep(0.05)
+            raw = await page.screenshot()
+            frames.append(Image.open(io.BytesIO(raw)).convert("RGB"))
+
+        await context.close()
+        await browser.close()
+
+    video_out = _write_video(frames, video_path)
+
+    return PageContent(
+        url=file_url,
+        text=text,
+        screenshot_path=screenshot_path,
+        video_path=video_out,
+        audio_path=None,
+        metadata={
+            "title": title,
+            "headings": headings,
+            "cta_texts": cta_texts,
+            "source": "html_upload",
+        },
+    )
+
+
 def _write_video(frames: list[Image.Image], video_path: str) -> str:
     if not frames:
         return ""
