@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+playwright
+imageio[ffmpeg]
+opencv-python
+openai
+anthropic
+python-dotenv
+httpx
+Pillow
+numpy
+python-multipart
+textstat
