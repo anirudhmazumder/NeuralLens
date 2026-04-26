@@ -30,6 +30,7 @@ That deployment can interface with NeuralLens by:
 - and returning structured outputs (scores, accepted edits, and final artifacts) back into agent pipelines.
 
 This makes NeuralLens usable both as a standalone app and as an optimization service in autonomous agent ecosystems.
+Implementation details for the Agentverse/uAgents stack live in `fetchai_integrations/README.md`.
 
 ## Repository Structure
 

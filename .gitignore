@@ -4,7 +4,11 @@ __pycache__/
 .venv/
 venv/
 .env
+**/.env
 neurallens/.env
+fetchai_integrations/.env
+fetchai_integrations/uagents_core.log
+fetchai_integrations/.DS_Store
 .pytest_cache/
 .ruff_cache/
 build/
