@@ -1,21 +1,40 @@
-"""Neurological Evaluation Scale (NES) loss for TRIBE-guided optimization.
+"""Neural Engagement Score (NES) — optimization loss for TRIBE-guided editing.
 
-NES measures neurological soft signs (NSS) — subtle, non-localizable indicators
-of dysfunction in the cerebello-thalamo-prefrontal cortical circuit.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NAMING NOTE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"NES" here stands for Neural Engagement Score, a CUSTOM metric for measuring
+how well a web page's content balances engagement vs. cognitive overload.
 
-A HIGH NES score = MORE dysfunction (more soft signs).
+It should NOT be confused with the clinical Neurological Evaluation Scale
+(Buchanan & Heinrichs 1989), which is a bedside physical exam used to assess
+neurological soft signs (NSS) in schizophrenia and related conditions. Clinical
+NSS are measured by tasks like tandem gait and graphesthesia — not by fMRI
+activation from viewing a stimulus.
+
+The term "neurological soft signs" and "cerebello-thalamo-prefrontal circuit"
+appear in the docstring for historical reasons and are scientifically imprecise
+in this context. What we actually measure is:
+  - Over-activation of stress/overload regions (Amygdala, ACC, Insula)
+  - Under-activation of engagement/clarity regions (PFC, Hippocampus)
+
+This is a valid optimization objective for neural engagement; the clinical NES
+terminology is just a misnomer.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A HIGH NES score = MORE dysfunction (more overload / less engagement).
 We MINIMIZE the NES score each optimization iteration.
 
-NSS indicators mapped to HCP-MMP1 regions:
+Indicators mapped to HCP-MMP1 regions:
 
-  Hyper-activation (region exceeds threshold → dysfunction):
-    ACC       — motor-sequencing conflicts, task-switching rigidity   threshold 0.40
-    Amygdala  — emotional dysregulation, disinhibition               threshold 0.40
-    Insula    — sensory integration overload, interoceptive noise     threshold 0.40
+  Hyper-activation (region exceeds threshold → overload penalty):
+    ACC       — cognitive conflict, decision paralysis    threshold 0.40
+    Amygdala  — fear/anxiety/urgency signals              threshold 0.40
+    Insula    — sensory overload, visceral unease         threshold 0.40
 
-  Hypo-activation (region falls below threshold → circuit failure):
-    PFC         — prefrontal hypofunctionality, executive circuit     threshold 0.50
-    Hippocampus — memory-encoding failure, novelty-gating deficit     threshold 0.40
+  Hypo-activation (region falls below threshold → engagement failure):
+    PFC         — executive attention, clarity, trust     threshold 0.50
+    Hippocampus — novelty encoding, memorability          threshold 0.40
 
 Content that scores low on NES:
   - Doesn't trigger fear/urgency responses (Amygdala stays quiet)

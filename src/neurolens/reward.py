@@ -24,7 +24,7 @@ from typing import Literal
 Intent = Literal["engage", "trust", "convert", "accessibility", "gamification"]
 
 YERKES_CEILING = 0.85
-YERKES_PENALTY = 0.4
+YERKES_PENALTY = 0.4  # multiplier for graded over-stimulation penalty
 
 PENALTY_WEIGHTS: dict[str, float] = {
     "Amygdala": 1.5,
@@ -83,8 +83,14 @@ def compute(scores: dict[str, float], intent: Intent) -> RewardBreakdown:
     if intent != "gamification":
         penalties["NAcc"] = -1.0 * scores.get("NAcc", 0.0)
 
+    # Graded Yerkes-Dodson penalty: grows with distance above the ceiling,
+    # not a flat step. A region barely over (0.86) costs much less than one at
+    # 0.99. Formula: -YERKES_PENALTY * (excess)^1.5 per region.
     yerkes: list[str] = [r for r, s in scores.items() if s > YERKES_CEILING]
-    yerkes_pen = -YERKES_PENALTY * len(yerkes)
+    yerkes_pen = -sum(
+        YERKES_PENALTY * ((scores[r] - YERKES_CEILING) ** 1.5)
+        for r in yerkes
+    )
 
     total = sum(targets.values()) + sum(penalties.values()) + yerkes_pen
 

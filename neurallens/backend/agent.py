@@ -11,7 +11,7 @@ Uses GPT-4.1-nano with vision. Full context per call:
   - Score trajectory
 
 Agent has full autonomy over action_type selection — it should choose based
-on the current brain state, not follow a fixed rotation.
+on the current brain state while keeping iteration strategy diverse.
 """
 from __future__ import annotations
 
@@ -29,17 +29,37 @@ if TYPE_CHECKING:
 # ── System prompt ──────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are NeuralLens, an expert neuromarketing AI that edits web pages to minimize \
-neurological soft signs (NSS) as measured by TRIBE v2, a multimodal fMRI-trained \
-brain encoder. You are a specialist — you think in brain regions before you think \
-in words.
+You are NeuralLens, an expert neuromarketing AI that edits web pages to MAXIMIZE \
+the TRIBE v2 multimodal `overall_score` — a 0..1 engagement quality predicted \
+from a fMRI-trained brain encoder. You are a specialist: you think in brain \
+regions before you think in words.
+
+OPERATIVE METRIC (what the optimizer actually compares against):
+  - `overall_score` = 0.36·attention_roi + 0.34·language_roi + 0.30·visual_roi − 0.35·penalty
+  - Higher overall_score = better. Each iteration is ACCEPTED only if the new
+    overall_score exceeds the current overall_score.
+  - You will see the running history (baseline + every prior step). Use the
+    DIRECTION of the last delta to decide whether to push further on the same
+    lever or pivot to a different one.
+  - The Neural Engagement Score (NES) below is a secondary diagnostic lens —
+    LOWERING NES generally raises overall_score because penalty regions drop
+    and engagement regions rise. Treat NES as your "why this edit", but treat
+    overall_score as your "did it work".
+
+CRITICAL TASK-ALIGNMENT RULES:
+  - Edit the user's existing page copy; do not invent a new campaign concept.
+  - Never fabricate claims, numbers, timelines, prices, discounts, or trial periods.
+  - Do not inject generic ad slogans or hype copy that is not grounded in existing text.
+  - Keep edits semantically close to the original intent of the target element.
+  - Prefer concrete, factual clarity over dramatic persuasion language.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PART 1 — THE NES OBJECTIVE (what you minimize)
+PART 1 — THE NES DIAGNOSTIC (secondary lens)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-NES = Neurological Evaluation Scale. Measures dysfunction in the \
-cerebello-thalamo-prefrontal cortical circuit. LOW NES = healthy neural engagement.
+NES = Neural Engagement Score. Measures over-activation of stress/overload \
+regions and under-activation of engagement/clarity regions. LOW NES = better \
+neural engagement (and, almost always, higher overall_score).
 
   HYPER-ACTIVATION (above threshold → circuit overload, raises NES):
     Amygdala  > 0.40   weight 2.0   → fear, urgency, anxiety, distrust
@@ -103,7 +123,7 @@ Amygdala (fear/anxiety — KEEP LOW)
              threat language, fear-of-missing-out without benefit, risk emphasis,
              aggressive pop-up style copy, all-caps, excessive exclamation points
   LOWER IT: reframe to gain ("join" not "don't miss"), remove urgency copy,
-            soften tone, add reassurance ("cancel any time", "no risk"),
+            soften tone, add reassurance (without adding invented offers),
             replace negatives with positive equivalents
 
 ACC (cognitive conflict — KEEP LOW)
@@ -131,6 +151,13 @@ PART 3 — EDIT SKILLS
 PART 4 — HOW TO REASON (follow this chain every call)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+Step 0 — REVIEW LAST STEP: Did your previous edit move overall_score up or down?
+  If your last attempt was REJECTED (delta ≤ 0): change strategy. Don't repeat
+  the same family of edit. Look at the ROI deltas — which sub-score regressed?
+  If your last attempt was ACCEPTED: you are on a good trajectory. Decide
+  whether to keep pushing the same lever (same target region) or to pivot to
+  a different lever that's now the top remaining gap.
+
 Step 1 — DIAGNOSE: Which region is the PRIMARY NES driver right now?
   Check the violations list. The highest-weight violation is your target.
   If multiple violations, address the highest-weight one first.
@@ -145,6 +172,10 @@ Step 3 — SELECT: Which skill addresses your target region best?
   Don't cycle mechanically. Choose freely based on the playbook above.
   If memory stats show an action_type has negative avg_reward, avoid it.
   If one has strongly positive avg_reward, prefer it.
+  Keep strategy diverse across attempts: rotate between text, visual hierarchy/color,
+  social proof/trust, and structural ordering when possible.
+  Avoid repeating the same action_type in back-to-back iterations unless it is
+  clearly the only high-impact option.
 
 Step 4 — CRAFT: Write the replacement with surgical precision.
   The "original" must be verbatim text from the HTML/page text.
@@ -152,9 +183,11 @@ Step 4 — CRAFT: Write the replacement with surgical precision.
   Measure against the playbook: does it raise the target region?
   Does it keep penalty regions from rising?
 
-Step 5 — ESTIMATE: What delta do you expect on NES?
-  Each 0.1 improvement in a penalized region reduces NES by weight × 0.1.
-  Be honest about your estimate.
+Step 5 — ESTIMATE: What delta do you expect on overall_score?
+  Each 0.1 improvement in a penalized region typically lifts overall_score by
+  roughly 0.03–0.05 (penalty weight × 0.35). Each 0.1 raise of an engagement
+  region lifts the matched ROI by roughly its weighting. Be honest — small,
+  realistic estimates beat over-promising.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PART 5 — "original" FIELD RULES (critical)
@@ -236,7 +269,7 @@ def _build_diagnosis_block(brain_scores: dict, intent: str) -> str:
 
     lines = []
     if violations:
-        lines.append("NSS VIOLATIONS (primary NES drivers — address these first):")
+        lines.append("NES VIOLATIONS (primary score drivers — address these first):")
         for region, delta, weight, contribution in violations:
             cfg = NSS_INDICATORS[region]
             direction = "ABOVE" if cfg["direction"] == "above" else "BELOW"
@@ -247,7 +280,7 @@ def _build_diagnosis_block(brain_scores: dict, intent: str) -> str:
                 f"[playbook: {'LOWER this region' if cfg['direction'] == 'above' else 'RAISE this region'}]"
             )
     else:
-        lines.append("No NSS violations active — focus on raising engagement regions.")
+        lines.append("No NES violations active — focus on raising engagement regions.")
 
     low_engagement = [
         (r, brain_scores.get(r, 0.0))
@@ -285,6 +318,8 @@ class OptimizationAgent:
         brain_scores: Optional[dict] = None,
         ethics_flags: Optional[list] = None,
         intent: str = "engage",
+        recent_actions: Optional[list[str]] = None,
+        last_outcome: Optional[dict] = None,
     ) -> dict:
         if not self._live:
             raise RuntimeError(
@@ -306,6 +341,8 @@ class OptimizationAgent:
             brain_scores=brain_scores,
             ethics_flags=ethics_flags,
             intent=intent,
+            recent_actions=recent_actions,
+            last_outcome=last_outcome,
         )
 
     async def _call_openai(
@@ -318,6 +355,8 @@ class OptimizationAgent:
         brain_scores: Optional[dict] = None,
         ethics_flags: Optional[list] = None,
         intent: str = "engage",
+        recent_actions: Optional[list[str]] = None,
+        last_outcome: Optional[dict] = None,
     ) -> dict:
         import openai  # type: ignore
 
@@ -415,9 +454,31 @@ class OptimizationAgent:
                 },
             })
 
+        # ── Last-step outcome (drives Step 0 of the reasoning chain) ───────────
+        outcome_block = ""
+        if last_outcome:
+            verdict = "ACCEPTED ✓" if last_outcome.get("accepted") else "REJECTED ✗"
+            roi_d = last_outcome.get("roi_deltas") or {}
+            roi_str = "  ".join(f"Δ{k}={float(v):+.4f}" for k, v in roi_d.items())
+            outcome_block = (
+                "\n\n--- Last step outcome (use this for Step 0) ---\n"
+                f"action_type   = {last_outcome.get('action_type', '?')}\n"
+                f"verdict       = {verdict}\n"
+                f"score_delta   = {float(last_outcome.get('score_delta', 0)):+.4f}\n"
+                f"roi deltas    = {roi_str or 'n/a'}\n"
+                f"target        = {last_outcome.get('target', '')}\n"
+                f"original  → \"{(last_outcome.get('original') or '')[:120]}\"\n"
+                f"replacement → \"{(last_outcome.get('replacement') or '')[:120]}\"\n"
+                "If REJECTED, do NOT repeat this action_type or this lever — pivot.\n"
+                "If ACCEPTED, you may keep pushing the same lever, OR switch to the\n"
+                "next-largest gap if returns are diminishing."
+            )
+
         user_text = (
             f"URL: {getattr(page_content, 'url', '')}\n"
             f"Intent: {intent}  |  Iteration context: suggested_action={suggested_action}\n"
+            f"OBJECTIVE: maximize TRIBE overall_score. Your edit will be ACCEPTED only "
+            f"if it lifts overall_score above the current value.\n"
             f"\n--- Current TRIBE scores ---\n{score_block}\n"
             f"\n--- Score history ---\n{history_block}\n"
             f"{nes_block}"
@@ -425,11 +486,17 @@ class OptimizationAgent:
             f"{brain_block}"
             f"{gaze_block}"
             f"{ethics_block}"
+            f"{outcome_block}"
             + (f"\n\n--- Memory ---\n{memory_block}" if memory_block else "")
+            + (
+                f"\n\n--- Recent actions (avoid repeating unless clearly best) ---\n"
+                f"{', '.join(recent_actions[-6:])}"
+                if recent_actions else ""
+            )
             + f"\n\n--- Page HTML (copy verbatim text from here for 'original') ---\n{html_excerpt}"
             + f"\n\n--- Page text ---\n{text_excerpt}"
             + f"\n\n"
-            f"TASK: Follow the 5-step reasoning chain in Part 4 of your instructions.\n"
+            f"TASK: Follow the 6-step reasoning chain (Step 0-5) in Part 4.\n"
             f"Suggested action_type: '{suggested_action}' — but choose freely based on diagnosis.\n"
             f"If memory shows suggested type has negative avg_reward AND another has strongly positive, switch.\n"
             f"Output ONE JSON edit. No markdown fences."

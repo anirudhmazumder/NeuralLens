@@ -10,15 +10,47 @@ import asyncio
 import io
 import logging
 import os
+import platform
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+ScreenshotReadyCallback = Optional[Callable[[str], None | Awaitable[None]]]
+
+
+def _chromium_launch_kwargs(pw) -> dict:
+    """Build Playwright Chromium launch kwargs with macOS arch fallback.
+
+    Some environments report/resolve a mac-x64 executable path on arm64 Macs.
+    When that happens, prefer the sibling mac-arm64 binary if it exists.
+    """
+    kwargs: dict = {"args": ["--no-sandbox"]}
+    if os.uname().sysname != "Darwin" or platform.machine() != "arm64":
+        return kwargs
+
+    # On some macOS arm64 setups Playwright resolves headless-shell to mac-x64.
+    # Force Chromium channel so launch uses Chrome for Testing instead.
+    kwargs["channel"] = "chromium"
+
+    try:
+        default_exec = Path(pw.chromium.executable_path)
+    except Exception:
+        return kwargs
+
+    default_exec_str = str(default_exec)
+    if "mac-x64" not in default_exec_str:
+        return kwargs
+
+    arm_exec = Path(default_exec_str.replace("mac-x64", "mac-arm64"))
+    if arm_exec.exists():
+        kwargs["executable_path"] = str(arm_exec)
+        logger.info("Using arm64 Chromium executable: %s", arm_exec)
+    return kwargs
 
 
 @dataclass
@@ -32,7 +64,11 @@ class PageContent:
     metadata: dict = field(default_factory=dict)
 
 
-async def scrape(url: str, out_dir: str) -> PageContent:
+async def scrape(
+    url: str,
+    out_dir: str,
+    on_screenshot_ready: ScreenshotReadyCallback = None,
+) -> PageContent:
     """Simulate a human viewing the URL and return all captured content."""
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -43,7 +79,7 @@ async def scrape(url: str, out_dir: str) -> PageContent:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--no-sandbox"])
+        browser = await pw.chromium.launch(**_chromium_launch_kwargs(pw))
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
 
@@ -51,6 +87,8 @@ async def scrape(url: str, out_dir: str) -> PageContent:
 
         # Full-page screenshot
         await page.screenshot(path=screenshot_path, full_page=True)
+        # Start downstream work (e.g., gaze prediction) immediately.
+        _dispatch_screenshot_ready(on_screenshot_ready, screenshot_path)
 
         # Metadata
         title = await page.title()
@@ -112,17 +150,18 @@ async def scrape(url: str, out_dir: str) -> PageContent:
             }
         """)
 
-        # Scroll recording: 20 frames over ~10 seconds at 2 fps
+        # Scroll recording for TRIBE multimodal input.
+        # Keep it lightweight so first-pass optimization doesn't feel stuck.
         page_height = await page.evaluate("document.documentElement.scrollHeight")
         viewport_h = 800
-        scroll_steps = 20
+        scroll_steps = 8
         frames: list[Image.Image] = []
 
         for i in range(scroll_steps):
             frac = i / max(scroll_steps - 1, 1)
             pos = int(frac * max(0, page_height - viewport_h))
             await page.evaluate(f"window.scrollTo(0, {pos})")
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.03)
             raw = await page.screenshot()
             frames.append(Image.open(io.BytesIO(raw)).convert("RGB"))
 
@@ -164,7 +203,11 @@ async def scrape(url: str, out_dir: str) -> PageContent:
     )
 
 
-async def render_html_file(html_content: str, out_dir: str) -> PageContent:
+async def render_html_file(
+    html_content: str,
+    out_dir: str,
+    on_screenshot_ready: ScreenshotReadyCallback = None,
+) -> PageContent:
     """Render an HTML string via Playwright (file://) and return PageContent.
 
     Writes the HTML to a temp file, opens it in a headless Chromium browser,
@@ -184,13 +227,15 @@ async def render_html_file(html_content: str, out_dir: str) -> PageContent:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--no-sandbox"])
+        browser = await pw.chromium.launch(**_chromium_launch_kwargs(pw))
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
 
         await page.goto(file_url, wait_until="load", timeout=15_000)
 
         await page.screenshot(path=screenshot_path, full_page=True)
+        # Start downstream work (e.g., gaze prediction) immediately.
+        _dispatch_screenshot_ready(on_screenshot_ready, screenshot_path)
 
         title = await page.title()
         headings = await page.evaluate("""
@@ -257,6 +302,7 @@ async def render_html_file(html_content: str, out_dir: str) -> PageContent:
     return PageContent(
         url=file_url,
         text=text,
+        html=html_content[:8000],   # truncated source — used by agent as HTML excerpt
         screenshot_path=screenshot_path,
         video_path=video_out,
         audio_path=None,
@@ -267,6 +313,21 @@ async def render_html_file(html_content: str, out_dir: str) -> PageContent:
             "source": "html_upload",
         },
     )
+
+
+def _dispatch_screenshot_ready(
+    on_screenshot_ready: ScreenshotReadyCallback,
+    screenshot_path: str,
+) -> None:
+    """Fire screenshot-ready callback without blocking scrape progress."""
+    if on_screenshot_ready is None:
+        return
+    try:
+        maybe = on_screenshot_ready(screenshot_path)
+        if asyncio.iscoroutine(maybe):
+            asyncio.create_task(maybe)
+    except Exception as exc:
+        logger.warning("on_screenshot_ready callback failed: %s", exc)
 
 
 def _write_video(frames: list[Image.Image], video_path: str) -> str:

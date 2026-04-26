@@ -90,6 +90,11 @@ class HtmlOptimizeRequest(BaseModel):
     max_iterations: int = 10
 
 
+class DecisionRequest(BaseModel):
+    iteration: int
+    accept: bool
+
+
 # ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -164,6 +169,17 @@ async def get_result(job_id: str):
     return job.result
 
 
+@app.post("/job/{job_id}/decision")
+async def submit_decision(job_id: str, req: DecisionRequest):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    if job.status not in ("running", "pending"):
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}, not accepting decisions")
+    await job.decision_queue.put({"iteration": req.iteration, "accept": req.accept})
+    return {"ok": True}
+
+
 @app.get("/job/{job_id}/before-screenshot")
 async def before_screenshot(job_id: str):
     return FileResponse(_screenshot_path(job_id, "before_screenshot"), media_type="image/png")
@@ -172,6 +188,30 @@ async def before_screenshot(job_id: str):
 @app.get("/job/{job_id}/after-screenshot")
 async def after_screenshot(job_id: str):
     return FileResponse(_screenshot_path(job_id, "after_screenshot"), media_type="image/png")
+
+
+@app.get("/job/{job_id}/iteration/{step}/screenshot")
+async def iteration_screenshot(job_id: str, step: int):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    # Live during-run map first, then completed-job result map. Keys may be
+    # ints (in-memory) or strings (after JSON round-trip).
+    candidates: list[dict] = []
+    if getattr(job, "iteration_screenshots", None):
+        candidates.append(job.iteration_screenshots)
+    if job.result:
+        result_map = job.result.get("iteration_screenshots") or {}
+        if result_map:
+            candidates.append(result_map)
+    path = None
+    for m in candidates:
+        path = m.get(step) or m.get(str(step))
+        if path:
+            break
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="Iteration screenshot not available")
+    return FileResponse(path, media_type="image/png")
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────

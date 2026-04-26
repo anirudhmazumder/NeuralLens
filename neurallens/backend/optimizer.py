@@ -14,9 +14,11 @@ import os
 import random
 import tempfile
 import uuid
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from types import SimpleNamespace
 
 from playwright.async_api import async_playwright  # type: ignore[import-untyped]
 
@@ -25,7 +27,7 @@ import re as _re
 from agent import OptimizationAgent
 from memory import get_buffer
 from pattern_learner import get_library
-from scraper import PageContent, scrape
+from scraper import PageContent, _chromium_launch_kwargs, scrape
 from scorer import TribeScorer
 from stubs import ACTION_TYPES
 from visualizer import PageVisualizer
@@ -43,7 +45,13 @@ class JobState:
     error: Optional[str] = None
     events: list[dict] = field(default_factory=list)
     event_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    decision_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     gaze_regions: list = field(default_factory=list)
+    # Per-iteration screenshots accumulated during the live run (keyed by
+    # iteration step). The /job/{id}/iteration/{step}/screenshot endpoint
+    # reads this so the UI can show iteration thumbnails before the job
+    # completes and result is finalized.
+    iteration_screenshots: dict = field(default_factory=dict)
 
 
 jobs: dict[str, JobState] = {}
@@ -58,17 +66,47 @@ def _shaped_reward(score_delta: float, roi_deltas: dict, novelty: bool) -> float
     return round(base + lang_bonus + novelty_bonus, 4)
 
 
-def _exploitative_action() -> str:
+def _action_family(action_type: str) -> str:
+    if action_type in {"change_visual_hierarchy"}:
+        return "visual"
+    if action_type in {"reorder_sections"}:
+        return "structure"
+    if action_type in {"add_social_proof"}:
+        return "trust"
+    if action_type in {"adjust_meta_description"}:
+        return "meta"
+    return "text"
+
+
+def _diversify_action(preferred: str, recent_actions: list[str]) -> str:
+    """Prefer category variety across recent attempts."""
+    if not recent_actions:
+        return preferred
+    recent_families = {_action_family(a) for a in recent_actions[-2:] if a}
+    if _action_family(preferred) not in recent_families and preferred != recent_actions[-1]:
+        return preferred
+
+    candidates = [
+        a for a in ACTION_TYPES
+        if _action_family(a) not in recent_families and a != recent_actions[-1]
+    ]
+    if candidates:
+        return random.choice(candidates)
+    non_repeat = [a for a in ACTION_TYPES if a != recent_actions[-1]]
+    return random.choice(non_repeat) if non_repeat else preferred
+
+
+def _exploitative_action(recent_actions: list[str]) -> str:
     """Pick action type with best historical avg_reward, or random if no history."""
     stats = get_buffer().get_action_stats()
-    if not stats:
-        return random.choice(ACTION_TYPES)
-    return max(stats, key=lambda k: stats[k]["avg_reward"])
+    preferred = max(stats, key=lambda k: stats[k]["avg_reward"]) if stats else random.choice(ACTION_TYPES)
+    return _diversify_action(preferred, recent_actions)
 
 
-def _exploratory_action(tried: list[str]) -> str:
+def _exploratory_action(tried: list[str], recent_actions: list[str]) -> str:
     untried = [a for a in ACTION_TYPES if a not in tried]
-    return random.choice(untried) if untried else random.choice(ACTION_TYPES)
+    preferred = random.choice(untried) if untried else random.choice(ACTION_TYPES)
+    return _diversify_action(preferred, recent_actions)
 
 
 # ── Viz-component helpers ─────────────────────────────────────────────────────
@@ -117,6 +155,50 @@ class NeuralOptimizer:
     )
     page_visualizer: PageVisualizer = field(default_factory=PageVisualizer)
 
+    async def _await_user_acceptance(
+        self,
+        job: Optional[JobState],
+        *,
+        iteration: int,
+        default_accept: bool,
+    ) -> bool:
+        """Wait for explicit user accept/reject decision."""
+        if job is None:
+            return default_accept
+        while True:
+            decision = await job.decision_queue.get()
+            if int(decision.get("iteration", -1)) != iteration:
+                continue
+            return bool(decision.get("accept", default_accept))
+
+    async def _await_with_watchdog(
+        self,
+        job: Optional[JobState],
+        awaitable,
+        *,
+        stage_label: str,
+        iteration_count: int,
+        max_iterations: int,
+        tick_s: float = 1.0,
+    ):
+        """Await a task and emit a single TRIBE-latency wait event."""
+        task = asyncio.create_task(awaitable)
+        timeout_budget = max(1, int(getattr(self.scorer, "timeout_seconds", 90)))
+        done, _ = await asyncio.wait({task}, timeout=tick_s)
+        if task in done:
+            return task.result()
+
+        await self._emit(job, "progress", {
+            "status": "scoring_wait",
+            "message": f"Waiting on TRIBE API: {stage_label}.",
+            "stage_label": stage_label,
+            "wait_started_at": time.time(),
+            "timeout_seconds": timeout_budget,
+            "iteration_count": iteration_count,
+            "max_iterations": max_iterations,
+        })
+        return await task
+
     async def run(
         self,
         url: str,
@@ -134,13 +216,23 @@ class NeuralOptimizer:
         os.makedirs(work_dir, exist_ok=True)
 
         try:
+            from gaze_predictor import get_gaze_predictor
+
+            predictor = get_gaze_predictor()
+            gaze_task: Optional[asyncio.Task] = None
+
+            def _start_gaze_early(screenshot_path: str) -> None:
+                nonlocal gaze_task
+                if gaze_task is None:
+                    gaze_task = asyncio.create_task(predictor.analyze(screenshot_path))
+
             # ── 1. Scrape ─────────────────────────────────────────────────
             await self._emit(job, "progress", {
                 "status": "scraping",
                 "message": "Simulating human browsing the page…",
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
-            page = await scrape(url, work_dir)
+            page = await scrape(url, work_dir, on_screenshot_ready=_start_gaze_early)
             viz_components = _text_to_viz_components(page.text)
 
             # ── 2. Gaze analysis ──────────────────────────────────────────
@@ -149,9 +241,23 @@ class NeuralOptimizer:
                 "message": "Predicting human gaze patterns…",
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
-            from gaze_predictor import get_gaze_predictor
-            gaze_data = await get_gaze_predictor().analyze(page.screenshot_path)
+            if gaze_task is None:
+                gaze_task = asyncio.create_task(predictor.analyze(page.screenshot_path))
+            gaze_data = await gaze_task
             gaze_regions = gaze_data["regions"]
+            gaze_overlay_b64 = ""
+            try:
+                overlay_path = os.path.join(work_dir, "gaze_overlay.png")
+                _loop = asyncio.get_event_loop()
+                await _loop.run_in_executor(
+                    None, predictor.generate_heatmap_overlay, page.screenshot_path, overlay_path
+                )
+                if overlay_path and os.path.exists(overlay_path):
+                    import base64
+                    with open(overlay_path, "rb") as fh:
+                        gaze_overlay_b64 = base64.b64encode(fh.read()).decode()
+            except Exception as exc:
+                print(f"[gaze] overlay generation failed: {exc}")
             if job:
                 job.gaze_regions = gaze_regions
             await self._emit(job, "gaze", {
@@ -162,17 +268,24 @@ class NeuralOptimizer:
                 ),
                 "gaze_regions": gaze_regions,
                 "gaze_live": gaze_data.get("gaze_live", False),
+                "gaze_overlay_base64": gaze_overlay_b64,
             })
 
             # ── 3. Baseline ───────────────────────────────────────────────
             await self._emit(job, "progress", {
                 "status": "scoring",
-                "message": "Computing baseline neural activation…",
+                "message": "Computing baseline neural activation (TRIBE API)…",
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
-            baseline_score = await self.scorer.score(
-                page.video_path, page.text, page.audio_path,
-                screenshot_path=page.screenshot_path,
+            baseline_score = await self._await_with_watchdog(
+                job,
+                self.scorer.score(
+                    page.video_path, page.text, page.audio_path,
+                    screenshot_path=page.screenshot_path,
+                ),
+                stage_label="baseline score",
+                iteration_count=0,
+                max_iterations=max_iterations,
             )
             current_score = baseline_score.copy()
             current_text = page.text
@@ -182,6 +295,8 @@ class NeuralOptimizer:
             accepted_comp_ids: list[str] = []
             current_screenshot_path: str = page.screenshot_path or ""
             pending_resample: Optional[asyncio.Task] = None
+            # Per-iteration screenshots (accepted edits only). Keyed by step.
+            iteration_screenshots: dict[int, str] = {}
 
             # Seed viz_components with proportionally-weighted baseline scores
             n_vc = max(len(viz_components), 1)
@@ -193,9 +308,20 @@ class NeuralOptimizer:
 
             # ── Brain region scoring at baseline ──────────────────────────
             from brain_regions import evaluate_ethics, compute_intent_reward
-            baseline_brain = await self.scorer.score_brain_regions(
-                page.screenshot_path or None, text=page.text
-            )
+            # Reuse atlas_regions returned by score() — same TRIBE response,
+            # no second round-trip needed. Falls back to a fresh call only
+            # if score() somehow didn't include them.
+            baseline_brain = (baseline_score.get("atlas_regions") or {}).copy()
+            if not baseline_brain:
+                baseline_brain = await self._await_with_watchdog(
+                    job,
+                    self.scorer.score_brain_regions(
+                        page.screenshot_path or None, text=page.text
+                    ),
+                    stage_label="baseline brain-region score",
+                    iteration_count=0,
+                    max_iterations=max_iterations,
+                )
             current_brain = baseline_brain.copy()
             baseline_ethics = evaluate_ethics(baseline_brain, intent)
 
@@ -225,7 +351,13 @@ class NeuralOptimizer:
                     try:
                         resample_result = pending_resample.result()
                         if resample_result:
-                            current_screenshot_path, gaze_regions = resample_result
+                            new_path, new_gaze, resample_step = resample_result
+                            current_screenshot_path = new_path
+                            gaze_regions = new_gaze
+                            if new_path:
+                                iteration_screenshots[resample_step] = new_path
+                                if job:
+                                    job.iteration_screenshots[resample_step] = new_path
                             if job:
                                 job.gaze_regions = gaze_regions
                             await self._emit(job, "gaze", {
@@ -237,6 +369,11 @@ class NeuralOptimizer:
                                 "gaze_regions": gaze_regions,
                                 "iteration_count": step,
                                 "max_iterations": max_iterations,
+                                "iteration_screenshot_step": resample_step,
+                            })
+                            await self._emit(job, "iteration_screenshot", {
+                                "iteration_count": resample_step,
+                                "max_iterations": max_iterations,
                             })
                     except Exception as _exc:
                         print(f"[resample] drain error: {_exc}")
@@ -246,11 +383,12 @@ class NeuralOptimizer:
                 epsilon = max(0.1, 1.0 - step / max_iterations)
                 exploit = random.random() > epsilon
                 strategy = "exploit" if exploit else "explore"
+                recent_actions = [h.get("action", {}).get("action_type", "") for h in history[-3:]]
 
                 if exploit:
-                    action_type = _exploitative_action()
+                    action_type = _exploitative_action(recent_actions)
                 else:
-                    action_type = _exploratory_action(episode_tried)
+                    action_type = _exploratory_action(episode_tried, recent_actions)
 
                 # Override agent's cycling index to the selected action
                 if action_type in ACTION_TYPES:
@@ -269,13 +407,36 @@ class NeuralOptimizer:
 
                 current_ethics = evaluate_ethics(current_brain, intent)
                 score_history = [baseline_score] + [h["score"] for h in history]
+                page_for_agent = SimpleNamespace(
+                    url=page.url,
+                    text=current_text,
+                    html=getattr(page, "html", ""),
+                )
+
+                # Build last-step outcome packet so the agent can self-correct.
+                last_outcome: Optional[dict] = None
+                if history:
+                    last = history[-1]
+                    last_action = last.get("action") or {}
+                    last_outcome = {
+                        "accepted": bool(last.get("accepted")),
+                        "score_delta": float(last.get("reward", 0.0)),
+                        "roi_deltas": last.get("roi_deltas") or {},
+                        "action_type": last_action.get("action_type", ""),
+                        "target": last_action.get("target", ""),
+                        "original": last_action.get("original", ""),
+                        "replacement": last_action.get("replacement", ""),
+                    }
+
                 edit = await self.agent.select_action(
-                    page, score_history, step,
+                    page_for_agent, score_history, step,
                     screenshot_path=current_screenshot_path,
                     gaze_regions=gaze_regions or None,
                     brain_scores=current_brain,
                     ethics_flags=current_ethics,
                     intent=intent,
+                    recent_actions=recent_actions,
+                    last_outcome=last_outcome,
                 )
                 episode_tried.append(edit.get("action_type", action_type))
 
@@ -293,7 +454,7 @@ class NeuralOptimizer:
 
                 await self._emit(job, "progress", {
                     "status": "scoring",
-                    "message": f"[{step}/{max_iterations}] Scoring updated content…",
+                    "message": f"[{step}/{max_iterations}] Scoring updated content (TRIBE API)…",
                     "iteration_count": step, "max_iterations": max_iterations,
                 })
 
@@ -309,16 +470,31 @@ class NeuralOptimizer:
                     list(accepted_comp_ids),
                     [],
                 )
-                new_score = await self.scorer.score(
-                    page.video_path, updated_text, page.audio_path,
-                    screenshot_path=current_screenshot_path,
+                new_score = await self._await_with_watchdog(
+                    job,
+                    self.scorer.score(
+                        page.video_path, updated_text, page.audio_path,
+                        screenshot_path=current_screenshot_path,
+                    ),
+                    stage_label=f"iteration {step} score",
+                    iteration_count=step,
+                    max_iterations=max_iterations,
                 )
                 annotated_b64 = await annot_task
 
-                # Brain region scoring on current screenshot (fast local stub)
-                new_brain = await self.scorer.score_brain_regions(
-                    current_screenshot_path or None, text=updated_text
-                )
+                # Reuse atlas_regions from the TRIBE response we already paid for.
+                # (Eliminates a redundant ~2-15s TRIBE round-trip per iteration.)
+                new_brain = (new_score.get("atlas_regions") or {}).copy()
+                if not new_brain:
+                    new_brain = await self._await_with_watchdog(
+                        job,
+                        self.scorer.score_brain_regions(
+                            current_screenshot_path or None, text=updated_text
+                        ),
+                        stage_label=f"iteration {step} brain-region score",
+                        iteration_count=step,
+                        max_iterations=max_iterations,
+                    )
                 step_ethics = evaluate_ethics(new_brain, intent, prev_scores=current_brain)
                 intent_reward = compute_intent_reward(new_brain, current_brain, intent)
 
@@ -337,7 +513,32 @@ class NeuralOptimizer:
 
                 novelty = edit.get("action_type", "") not in episode_tried[:-1]
                 shaped = _shaped_reward(score_delta, roi_deltas, novelty)
-                accepted = score_delta > 0
+                auto_accept = score_delta > 0
+                prev_overall = current_score["overall_score"]
+                await self._emit(job, "progress", {
+                    "status": "approval_needed",
+                    "message": (
+                        f"[{step}/{max_iterations}] Run paused — review proposed change."
+                    ),
+                    "iteration_count": step,
+                    "max_iterations": max_iterations,
+                    "edit": edit,
+                    "score_delta": round(score_delta, 4),
+                    "current_overall": round(prev_overall, 4),
+                    "proposed_overall": round(new_score["overall_score"], 4),
+                    "roi_deltas": roi_deltas,
+                    "shaped_reward": shaped,
+                    "intent_reward": intent_reward,
+                    "default_decision": "accept" if auto_accept else "reject",
+                    "annotated_screenshot_base64": annotated_b64,
+                    "strategy": strategy,
+                    "epsilon": round(epsilon, 2),
+                })
+                accepted = await self._await_user_acceptance(
+                    job,
+                    iteration=step,
+                    default_accept=auto_accept,
+                )
 
                 # Persist to both memory systems
                 get_buffer().store(
@@ -363,9 +564,12 @@ class NeuralOptimizer:
                     current_score = new_score
                     current_text = updated_text
                     current_brain = new_brain
+                    edit["iteration"] = step
                     accepted_edits.append(edit)
                     accepted_comp_ids.append(target_id)
-                    # Fire background re-render + gaze re-sample (non-blocking)
+                    # Fire background re-render + gaze re-sample (non-blocking).
+                    # The resampled screenshot is stored per-step so the UI can
+                    # walk through the page evolution in the result panel.
                     if pending_resample is None or pending_resample.done():
                         pending_resample = asyncio.create_task(
                             _resample_page(url, accepted_edits[:], work_dir, step)
@@ -390,7 +594,7 @@ class NeuralOptimizer:
                     "epsilon": round(epsilon, 2),
                     "score_delta": round(score_delta, 4),
                     "new_score": round(new_score["overall_score"], 4),
-                    "prev_score": round(current_score["overall_score"] if not accepted else baseline_score["overall_score"], 4),
+                    "prev_score": round(prev_overall, 4),
                 }
 
                 memory_count = pattern_lib.get_experience_count()
@@ -443,7 +647,23 @@ class NeuralOptimizer:
                 "iteration_count": max_iterations,
                 "max_iterations": max_iterations,
             })
-            after_shot = await _render_optimized_screenshot(url, accepted_edits, work_dir)
+            # Drain any still-running resample so the last iteration screenshot
+            # is captured before we render the cumulative "after".
+            if pending_resample is not None and not pending_resample.done():
+                try:
+                    final_resample = await pending_resample
+                    if final_resample:
+                        rs_path, _rs_gaze, rs_step = final_resample
+                        if rs_path:
+                            iteration_screenshots[rs_step] = rs_path
+                            if job:
+                                job.iteration_screenshots[rs_step] = rs_path
+                except Exception as _exc:
+                    print(f"[resample] final drain error: {_exc}")
+                pending_resample = None
+            after_shot = await _render_optimized_screenshot(
+                url, accepted_edits, work_dir, highlight=True
+            )
 
             # ── 5. Discover patterns from this episode ────────────────────
             pattern_lib.discover_patterns()
@@ -466,6 +686,7 @@ class NeuralOptimizer:
                 "final_content": current_text,
                 "before_screenshot": page.screenshot_path,
                 "after_screenshot": after_shot,
+                "iteration_screenshots": iteration_screenshots,
                 "discovered_patterns": get_library().get_experience_count(),
                 "gaze_regions": gaze_regions,
                 "gaze_live": gaze_data.get("gaze_live", False),
@@ -482,7 +703,7 @@ class NeuralOptimizer:
             return result
 
         except Exception as exc:
-            msg = str(exc)
+            msg = str(exc).strip() or f"{exc.__class__.__name__}: no error details provided"
             if job:
                 job.status = "error"
                 job.error = msg
@@ -519,21 +740,23 @@ def _infer_component_type(edit: dict) -> str:
 
 async def _resample_page(
     url: str, accepted_edits: list, work_dir: str, step: int
-) -> Optional[tuple[str, list]]:
+) -> Optional[tuple[str, list, int]]:
     """Re-render page with current accepted edits, take screenshot, re-run gaze.
 
     Runs as a fire-and-forget background task so it never blocks the RL loop.
-    Returns (screenshot_path, gaze_regions) or None on failure.
+    Returns (screenshot_path, gaze_regions, step) or None on failure. The
+    rendered screenshot has the changed text softly highlighted so the
+    Before/After comparison makes the delta visually obvious.
     """
     from gaze_predictor import get_gaze_predictor
     try:
         ss_path = await _render_optimized_screenshot(
-            url, accepted_edits, work_dir, suffix=f"_step{step}"
+            url, accepted_edits, work_dir, suffix=f"_step{step}", highlight=True
         )
         if not ss_path:
             return None
         gaze_data = await get_gaze_predictor().analyze(ss_path)
-        return ss_path, gaze_data.get("regions", [])
+        return ss_path, gaze_data.get("regions", []), step
     except Exception as exc:
         print(f"[resample] step {step} failed: {exc}")
         return None
@@ -558,6 +781,22 @@ class HtmlOptimizationLoop:
         default_factory=lambda: OptimizationAgent(memory=get_buffer())
     )
 
+    async def _await_user_acceptance(
+        self,
+        job: Optional[JobState],
+        *,
+        iteration: int,
+        default_accept: bool,
+    ) -> bool:
+        """Wait for explicit user accept/reject decision (HTML loop)."""
+        if job is None:
+            return default_accept
+        while True:
+            decision = await job.decision_queue.get()
+            if int(decision.get("iteration", -1)) != iteration:
+                continue
+            return bool(decision.get("accept", default_accept))
+
     async def run(
         self,
         html_content: str,
@@ -575,13 +814,23 @@ class HtmlOptimizationLoop:
             from scraper import render_html_file
             from gaze_predictor import get_gaze_predictor
 
+            predictor = get_gaze_predictor()
+            gaze_task: Optional[asyncio.Task] = None
+
+            def _start_gaze_early(screenshot_path: str) -> None:
+                nonlocal gaze_task
+                if gaze_task is None:
+                    gaze_task = asyncio.create_task(predictor.analyze(screenshot_path))
+
             # ── 1. Initial render ─────────────────────────────────────────
             await self._emit(job, "progress", {
                 "status": "scraping",
                 "message": f"Rendering uploaded HTML file '{filename}'…",
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
-            page = await render_html_file(html_content, work_dir)
+            page = await render_html_file(
+                html_content, work_dir, on_screenshot_ready=_start_gaze_early
+            )
             before_screenshot = page.screenshot_path
 
             # ── 2. Gaze analysis ──────────────────────────────────────────
@@ -590,7 +839,9 @@ class HtmlOptimizationLoop:
                 "message": "Predicting gaze patterns on uploaded page…",
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
-            gaze_data = await get_gaze_predictor().analyze(page.screenshot_path)
+            if gaze_task is None:
+                gaze_task = asyncio.create_task(predictor.analyze(page.screenshot_path))
+            gaze_data = await gaze_task
             gaze_regions = gaze_data["regions"]
 
             await self._emit(job, "gaze", {
@@ -618,6 +869,7 @@ class HtmlOptimizationLoop:
             current_screenshot = page.screenshot_path
             history: list[dict] = []
             accepted_edits: list[dict] = []
+            iteration_screenshots: dict[int, str] = {}
 
             await self._emit(job, "progress", {
                 "status": "baseline",
@@ -625,6 +877,18 @@ class HtmlOptimizationLoop:
                 "score": baseline_score,
                 "iteration_count": 0, "max_iterations": max_iterations,
             })
+
+            # Emit baseline brain regions so BrainPanel shows data immediately
+            from brain_regions import evaluate_ethics
+            baseline_brain = baseline_score.get("atlas_regions") or {}
+            if baseline_brain:
+                await self._emit(job, "brain_regions", {
+                    "iteration_count": 0,
+                    "regions": baseline_brain,
+                    "ethics_flags": evaluate_ethics(baseline_brain, "engage"),
+                    "intent": "engage",
+                    "is_baseline": True,
+                })
 
             # ── 4. RL episode ─────────────────────────────────────────────
             for step in range(1, max_iterations + 1):
@@ -682,13 +946,45 @@ class HtmlOptimizationLoop:
                 )
 
                 score_delta = new_score["overall_score"] - current_score["overall_score"]
-                accepted = score_delta > 0
+                auto_accept = score_delta > 0
+                prev_overall_html = current_score["overall_score"]
+                await self._emit(job, "progress", {
+                    "status": "approval_needed",
+                    "message": (
+                        f"[{step}/{max_iterations}] Run paused — review proposed HTML change."
+                    ),
+                    "iteration_count": step,
+                    "max_iterations": max_iterations,
+                    "edit": {
+                        **edit,
+                        "original": edit.get("html_original", ""),
+                        "replacement": edit.get("html_replacement", ""),
+                    },
+                    "score_delta": round(score_delta, 4),
+                    "current_overall": round(prev_overall_html, 4),
+                    "proposed_overall": round(new_score["overall_score"], 4),
+                    "default_decision": "accept" if auto_accept else "reject",
+                })
+                accepted = await self._await_user_acceptance(
+                    job,
+                    iteration=step,
+                    default_accept=auto_accept,
+                )
 
                 if accepted:
                     current_score = new_score
                     current_html = updated_html
                     current_screenshot = step_screenshot
+                    edit["iteration"] = step
                     accepted_edits.append(edit)
+                    if step_screenshot:
+                        iteration_screenshots[step] = step_screenshot
+                        if job:
+                            job.iteration_screenshots[step] = step_screenshot
+                        await self._emit(job, "iteration_screenshot", {
+                            "iteration_count": step,
+                            "max_iterations": max_iterations,
+                        })
 
                 entry = {
                     "iteration": step,
@@ -732,6 +1028,17 @@ class HtmlOptimizationLoop:
                     "agent_thought": agent_thought,
                 })
 
+                # Emit brain regions so BrainPanel updates each iteration
+                step_brain = new_score.get("atlas_regions") or {}
+                if step_brain:
+                    await self._emit(job, "brain_regions", {
+                        "iteration_count": step,
+                        "regions": step_brain,
+                        "ethics_flags": evaluate_ethics(step_brain, "engage"),
+                        "intent": "engage",
+                        "accepted": accepted,
+                    })
+
             # ── 5. Build result ───────────────────────────────────────────
             bv = baseline_score["overall_score"]
             fv = current_score["overall_score"]
@@ -748,6 +1055,7 @@ class HtmlOptimizationLoop:
                 "accepted_edits": accepted_edits,
                 "before_screenshot": before_screenshot,
                 "after_screenshot": current_screenshot,
+                "iteration_screenshots": iteration_screenshots,
                 "optimized_html": current_html,
                 "gaze_regions": gaze_regions,
                 "gaze_live": gaze_data.get("gaze_live", False),
@@ -777,38 +1085,158 @@ class HtmlOptimizationLoop:
         await job.event_queue.put(event)
 
 
+# Robust replacement helper injected into the page once per render.
+# Tries (in order) exact match, whitespace-normalized match, case-insensitive
+# match. Highlights the replaced fragment so the "after" screenshot makes the
+# delta visually obvious. Returns true if any replacement happened.
+_DOM_REPLACE_JS = r"""
+([o, r, highlight]) => {
+    if (!o) return false;
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    const nO = norm(o);
+    if (!nO) return false;
+
+    const wrap = (node, original, replacement) => {
+        const idx = node.textContent.indexOf(original);
+        if (idx < 0) return false;
+        const before = node.textContent.slice(0, idx);
+        const after  = node.textContent.slice(idx + original.length);
+        const span = document.createElement('span');
+        span.textContent = replacement;
+        if (highlight) {
+            span.style.background = 'rgba(124, 58, 237, 0.18)';
+            span.style.borderBottom = '2px solid rgba(124, 58, 237, 0.85)';
+            span.style.padding = '0 2px';
+            span.style.borderRadius = '2px';
+        }
+        const parent = node.parentNode;
+        if (!parent) return false;
+        if (before) parent.insertBefore(document.createTextNode(before), node);
+        parent.insertBefore(span, node);
+        if (after) parent.insertBefore(document.createTextNode(after), node);
+        parent.removeChild(node);
+        return true;
+    };
+
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => {
+            if (!n.textContent || !n.textContent.trim()) return NodeFilter.FILTER_REJECT;
+            const p = n.parentNode;
+            if (!p) return NodeFilter.FILTER_REJECT;
+            const tag = (p.tagName || '').toLowerCase();
+            if (tag === 'script' || tag === 'style' || tag === 'noscript') return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+        }
+    });
+    const nodes = [];
+    let n;
+    while ((n = w.nextNode())) nodes.push(n);
+
+    // Pass 1: exact substring
+    for (const node of nodes) {
+        if (node.textContent.includes(o)) {
+            return wrap(node, o, r);
+        }
+    }
+    // Pass 2: whitespace-normalized
+    for (const node of nodes) {
+        const nT = norm(node.textContent);
+        if (nT.includes(nO)) {
+            // replace the entire node text with normalized substitution
+            const rebuilt = nT.replace(nO, r);
+            const parent = node.parentNode;
+            if (!parent) continue;
+            const span = document.createElement('span');
+            span.textContent = rebuilt;
+            if (highlight) {
+                span.style.background = 'rgba(124, 58, 237, 0.18)';
+                span.style.borderBottom = '2px solid rgba(124, 58, 237, 0.85)';
+                span.style.padding = '0 2px';
+                span.style.borderRadius = '2px';
+            }
+            parent.replaceChild(span, node);
+            return true;
+        }
+    }
+    // Pass 3: case-insensitive exact
+    const lo = o.toLowerCase();
+    for (const node of nodes) {
+        const idx = node.textContent.toLowerCase().indexOf(lo);
+        if (idx >= 0) {
+            const real = node.textContent.slice(idx, idx + o.length);
+            return wrap(node, real, r);
+        }
+    }
+    return false;
+}
+"""
+
+
+async def _apply_edits_to_page(page, accepted_edits: list, *, highlight: bool = True) -> dict[str, int]:
+    """Apply each accepted edit to the live Playwright page DOM.
+
+    Returns a dict with counts: {applied, skipped, missing_text}. The
+    optimizer can surface these so we know whether the after-screenshot
+    actually reflects the requested changes.
+    """
+    applied = 0
+    missing = 0
+    skipped = 0
+    for edit in accepted_edits:
+        orig = (edit.get("original") or "").strip()
+        repl = edit.get("replacement", "")
+        if not (orig and repl):
+            skipped += 1
+            continue
+        try:
+            ok = await page.evaluate(_DOM_REPLACE_JS, [orig, repl, bool(highlight)])
+        except Exception as exc:
+            print(f"[render] DOM replace failed for edit {edit.get('action_type', '?')}: {exc}")
+            skipped += 1
+            continue
+        if ok:
+            applied += 1
+        else:
+            missing += 1
+    return {"applied": applied, "skipped": skipped, "missing_text": missing}
+
+
 async def _render_optimized_screenshot(
-    url: str, accepted_edits: list, out_dir: str, suffix: str = ""
+    url: str,
+    accepted_edits: list,
+    out_dir: str,
+    suffix: str = "",
+    *,
+    highlight: bool = False,
 ) -> str:
+    """Render the URL with all accepted edits applied and screenshot it.
+
+    `highlight=True` softly underlines the replaced text so the after
+    screenshot makes the delta visually obvious to the operator.
+    """
     dest = str(Path(out_dir) / f"optimized_screenshot{suffix}.png")
     try:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(args=["--no-sandbox"])
+            browser = await pw.chromium.launch(**_chromium_launch_kwargs(pw))
             ctx = await browser.new_context(viewport={"width": 1280, "height": 800})
             page = await ctx.new_page()
             await page.goto(url, wait_until="networkidle", timeout=30_000)
-            for edit in accepted_edits:
-                orig = edit.get("original", "")
-                repl = edit.get("replacement", "")
-                if not (orig and repl):
-                    continue
-                await page.evaluate(
-                    """([o, r]) => {
-                        const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                        const ns = []; let n;
-                        while ((n = w.nextNode())) ns.push(n);
-                        for (const n of ns) {
-                            if (n.textContent.includes(o)) {
-                                n.textContent = n.textContent.replace(o, r); break;
-                            }
-                        }
-                    }""",
-                    [orig, repl],
-                )
+            stats = await _apply_edits_to_page(page, accepted_edits, highlight=highlight)
+            print(
+                f"[render] applied={stats['applied']} skipped={stats['skipped']} "
+                f"missing_text={stats['missing_text']} edits={len(accepted_edits)} "
+                f"suffix={suffix or 'final'}"
+            )
+            # Give the page a tick to relayout after DOM mutations.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=2_000)
+            except Exception:
+                pass
             await page.evaluate("window.scrollTo(0, 0)")
             await page.screenshot(path=dest, full_page=True)
             await ctx.close()
             await browser.close()
         return dest
-    except Exception:
+    except Exception as exc:
+        print(f"[render] failed: {exc}")
         return ""

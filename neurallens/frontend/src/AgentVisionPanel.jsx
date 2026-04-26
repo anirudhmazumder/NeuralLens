@@ -6,8 +6,8 @@ import {
 
 // ── Terminal line builder ──────────────────────────────────────────────────────
 
-function buildLines(type, data) {
-  const t = new Date().toLocaleTimeString('en-US', { hour12: false })
+function buildLines(type, data, ts) {
+  const t = new Date(ts || Date.now()).toLocaleTimeString('en-US', { hour12: false })
   const line = (icon, text, color = 'text-gray-300') => ({ t, icon, text, color })
 
   if (type === 'progress') {
@@ -17,12 +17,24 @@ function buildLines(type, data) {
       case 'gaze_analysis':
         return [line('👁️', 'Predicting gaze patterns…', 'text-orange-400')]
       case 'scoring':
-        return []   // silent — too noisy
+        return [line('🧬', data.message || 'Waiting for TRIBE scoring response…', 'text-blue-300')]
+      case 'scoring_wait':
+        return [line('⏳', data.message || 'Still waiting on TRIBE API…', 'text-amber-300')]
       case 'baseline':
         return [line('🧠', `Baseline  overall=${data.score?.overall_score?.toFixed(4)}  L=${data.score?.language_roi?.toFixed(3)}  A=${data.score?.attention_roi?.toFixed(3)}  V=${data.score?.visual_roi?.toFixed(3)}`, 'text-violet-300')]
       case 'proposing': {
         const at = data.action_type || '?'
         return [line('⚡', `[${data.iteration_count}/${data.max_iterations}]  ε=${data.epsilon}  (${data.strategy})  →  ${at}`, 'text-yellow-300')]
+      }
+      case 'approval_needed': {
+        const cur = Number(data.current_overall ?? 0).toFixed(4)
+        const prop = Number(data.proposed_overall ?? 0).toFixed(4)
+        const d = Number(data.score_delta ?? 0)
+        return [line(
+          '⏸️',
+          `PAUSED  awaiting your decision  current=${cur}  proposed=${prop}  Δ=${d >= 0 ? '+' : ''}${d.toFixed(4)}`,
+          'text-violet-300',
+        )]
       }
       case 'iteration_complete': {
         const ok = data.accepted
@@ -151,7 +163,7 @@ export default function AgentVisionPanel({
       const { type, data } = ev
 
       // Build terminal lines
-      const newLines = buildLines(type, data)
+      const newLines = buildLines(type, data, ev.ts)
       lines.push(...newLines)
 
       if (type === 'gaze') {
@@ -353,12 +365,12 @@ export default function AgentVisionPanel({
         </span>
         {baselineScore && (
           <span className="text-xs text-gray-600 whitespace-nowrap">
-            Baseline <span className="text-violet-400 font-mono">{(baselineScore.overall_score * 100).toFixed(1)}</span>
+            Baseline <span className="text-violet-400 font-mono">{Number(baselineScore.overall_score || 0).toFixed(3)}</span>
           </span>
         )}
         {finalScore && (
           <span className="text-xs text-gray-600 whitespace-nowrap">
-            Current <span className="text-green-400 font-mono">{(finalScore.overall_score * 100).toFixed(1)}</span>
+            Current <span className="text-green-400 font-mono">{Number(finalScore.overall_score || 0).toFixed(3)}</span>
           </span>
         )}
         <span className={`text-xs font-semibold flex items-center gap-1.5 ${

@@ -15,18 +15,33 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-_CENTERBIAS_PATH = os.getenv("CENTERBIAS_PATH", "/workspace/centerbias_mit1003.npy")
+def _default_centerbias_path() -> str:
+    """Resolve centerbias file relative to the repo root.
+
+    Walks up from this file's location until it finds centerbias_mit1003.npy.
+    This avoids the hardcoded /workspace/ path that only works inside Docker.
+    """
+    here = Path(__file__).resolve()
+    for parent in [here.parent, here.parent.parent, here.parent.parent.parent]:
+        candidate = parent / "centerbias_mit1003.npy"
+        if candidate.exists():
+            return str(candidate)
+    # Best-guess fallback: three levels up is the repo root
+    return str(here.parent.parent.parent / "centerbias_mit1003.npy")
+
+
+_CENTERBIAS_PATH = os.getenv("CENTERBIAS_PATH", _default_centerbias_path())
 _GAZE_DEVICE = os.getenv("GAZE_DEVICE", "cpu")
-_MODEL_CACHE_PATH = Path(os.getenv(
-    "DEEPGAZE_CACHE_PATH",
-    os.path.expanduser("~/.cache/neurallens/deepgaze_iie.pth"),
-))
+_MAX_SALIENCY_CACHE = int(os.getenv("GAZE_SALIENCY_CACHE_SIZE", "16"))
+_MAX_REGION_CACHE = int(os.getenv("GAZE_REGION_CACHE_SIZE", "32"))
 
 
 @dataclass
@@ -91,6 +106,9 @@ class GazePredictor:
     def __init__(self) -> None:
         self.live = os.getenv("GAZE_LIVE", "false").lower() == "true"
         self._model = None
+        self._cache_lock = threading.Lock()
+        self._saliency_cache: OrderedDict[tuple[str, int], tuple[np.ndarray, int, int]] = OrderedDict()
+        self._region_cache: OrderedDict[tuple[str, int, int], list[GazeRegion]] = OrderedDict()
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -98,28 +116,32 @@ class GazePredictor:
         try:
             import torch
             from deepgaze_pytorch import DeepGazeIIE  # type: ignore[import-untyped]
-
-            if _MODEL_CACHE_PATH.exists():
-                # Load from local cache — no internet call on subsequent starts
-                model = DeepGazeIIE(pretrained=False)
-                model.load_state_dict(
-                    torch.load(str(_MODEL_CACHE_PATH), map_location=_GAZE_DEVICE)
-                )
-                print(f"[GazePredictor] DeepGaze IIE loaded from cache: {_MODEL_CACHE_PATH}")
-            else:
-                # First run: download once, then save for future starts
-                model = DeepGazeIIE(pretrained=True)
-                _MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), str(_MODEL_CACHE_PATH))
-                print(f"[GazePredictor] DeepGaze IIE downloaded and cached to {_MODEL_CACHE_PATH}")
-
-            self._model = model.to(_GAZE_DEVICE)
+            self._model = DeepGazeIIE(pretrained=True).to(_GAZE_DEVICE)
             self._model.eval()
+            print(f"[GazePredictor] DeepGaze IIE loaded on {_GAZE_DEVICE}")
         except (RuntimeError, OSError, Exception) as exc:
             # Corrupted checkpoint, missing file, or other load failure — fall back to stub
             print(f"[GazePredictor] model load failed ({exc.__class__.__name__}: {exc}) — using F-pattern stub")
             self.live = False
             self._model = None
+
+    def _cache_key(self, screenshot_path: str) -> Optional[tuple[str, int]]:
+        try:
+            path = Path(screenshot_path).resolve()
+            return (str(path), path.stat().st_mtime_ns)
+        except OSError:
+            return None
+
+    def _clone_regions(self, regions: list[GazeRegion]) -> list[GazeRegion]:
+        return [
+            GazeRegion(
+                rank=r.rank,
+                bbox=list(r.bbox),
+                saliency_score=r.saliency_score,
+                peak_coords=list(r.peak_coords),
+            )
+            for r in regions
+        ]
 
     # ── Saliency ───────────────────────────────────────────────────────────────
 
@@ -134,6 +156,15 @@ class GazePredictor:
 
         if not self.live:
             return _stub_saliency(h, w), h, w
+
+        key = self._cache_key(screenshot_path)
+        if key is not None:
+            with self._cache_lock:
+                cached = self._saliency_cache.get(key)
+                if cached is not None:
+                    self._saliency_cache.move_to_end(key)
+                    sal, h_cached, w_cached = cached
+                    return sal.copy(), h_cached, w_cached
 
         # ── Live: DeepGaze IIE ─────────────────────────────────────────────
         import torch
@@ -164,11 +195,26 @@ class GazePredictor:
             log_density = self._model(img_t, cb_t)
 
         sal = log_density.exp().cpu().numpy()[0, 0].astype(np.float32)
+        if key is not None:
+            with self._cache_lock:
+                self._saliency_cache[key] = (sal, h_img, w_img)
+                self._saliency_cache.move_to_end(key)
+                while len(self._saliency_cache) > _MAX_SALIENCY_CACHE:
+                    self._saliency_cache.popitem(last=False)
         return sal, h_img, w_img
 
     # ── Regions ────────────────────────────────────────────────────────────────
 
     def get_salient_regions(self, screenshot_path: str, top_k: int = 5) -> list[GazeRegion]:
+        key = self._cache_key(screenshot_path)
+        region_key = (key[0], key[1], top_k) if key is not None else None
+        if region_key is not None:
+            with self._cache_lock:
+                cached_regions = self._region_cache.get(region_key)
+                if cached_regions is not None:
+                    self._region_cache.move_to_end(region_key)
+                    return self._clone_regions(cached_regions)
+
         sal, h, w = self.predict_saliency(screenshot_path)
 
         mn, mx = sal.min(), sal.max()
@@ -176,7 +222,14 @@ class GazePredictor:
 
         win_h = max(h // 5, 60)
         win_w = max(w // 4, 80)
-        return _suppress_and_find_peaks(sal_norm, top_k, win_h, win_w)
+        regions = _suppress_and_find_peaks(sal_norm, top_k, win_h, win_w)
+        if region_key is not None:
+            with self._cache_lock:
+                self._region_cache[region_key] = self._clone_regions(regions)
+                self._region_cache.move_to_end(region_key)
+                while len(self._region_cache) > _MAX_REGION_CACHE:
+                    self._region_cache.popitem(last=False)
+        return regions
 
     # ── Heatmap overlay ────────────────────────────────────────────────────────
 
@@ -239,6 +292,24 @@ def get_gaze_predictor() -> GazePredictor:
 
 # ── Gaze-weighted score helper (used by scorer.py) ────────────────────────────
 
+def _text_quality_score(text: str) -> float:
+    """Cheap deterministic readability proxy: rewards concise, simple vocabulary.
+
+    Defined here (not imported from stubs) because stubs.py no longer carries it.
+    Optimal word count ~200; shorter avg word length = lower complexity penalty.
+    """
+    if not text:
+        return 0.5
+    words = text.split()
+    if not words:
+        return 0.5
+    optimal = 200
+    verbosity_penalty = min(0.15, abs(len(words) - optimal) / optimal * 0.15)
+    avg_word_len = sum(len(w.strip(".,!?;:")) for w in words) / len(words)
+    complexity_penalty = max(0.0, (avg_word_len - 5.0) * 0.02)
+    return max(0.0, min(1.0, 0.7 - verbosity_penalty - complexity_penalty))
+
+
 def gaze_weighted_score(base_score: dict, text: str, regions: list[dict]) -> dict:
     """Reweight overall_score by saliency-weighted text quality per region.
 
@@ -247,7 +318,6 @@ def gaze_weighted_score(base_score: dict, text: str, regions: list[dict]) -> dic
     saliency-weighted quality average with the base overall_score (50/50).
     No async calls — runs instantly.
     """
-    from stubs import _text_quality_score  # type: ignore
 
     words = text.split()
     n = len(regions)

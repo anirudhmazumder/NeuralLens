@@ -67,6 +67,8 @@ _NEGATIVE_WORDS = {
     "risk", "problem", "issue", "struggle", "fail", "lost", "miss", "waste",
 }
 _PASSIVE_HELPERS = {"was", "were", "is", "are", "be", "been", "being"}
+# Common past-participle endings. A be-verb + word-ending-in-these = passive bigram.
+_PP_ENDINGS = ("ed", "en", "ied", "wn", "ult", "ilt", "ept", "ent", "ung", "unk")
 
 
 def _flesch_ease(text: str) -> float:
@@ -115,11 +117,25 @@ def _social_proof(text: str) -> float:
 
 
 def _active_voice_ratio(text: str) -> float:
+    """Estimate active-voice ratio using be-verb + past-participle bigrams.
+
+    The naive approach of counting 'is', 'are', etc. misclassifies active-voice
+    copula constructions like "This is simple" as passive. We instead require a
+    be-verb immediately followed by a past-participle-form word (e.g. 'was designed',
+    'is shown', 'were launched').
+    """
     words = text.lower().split()
     if len(words) < 3:
         return 1.0
-    passive = sum(1 for w in words if w in _PASSIVE_HELPERS)
-    return 1.0 - passive / len(words)
+    passive_count = 0
+    for i in range(len(words) - 1):
+        w = words[i].strip(".,!?;:\"'")
+        nxt = words[i + 1].strip(".,!?;:\"'")
+        if w in _PASSIVE_HELPERS and any(nxt.endswith(sfx) for sfx in _PP_ENDINGS):
+            passive_count += 1
+    sentence_count = max(1, text.count(".") + text.count("!") + text.count("?"))
+    passive_ratio = min(1.0, passive_count / sentence_count)
+    return 1.0 - passive_ratio
 
 
 def _emotional_valence(text: str) -> float:

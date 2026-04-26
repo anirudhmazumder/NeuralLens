@@ -44,8 +44,25 @@ HCP_MMP1_MNI = AtlasManifest(
 
 
 KNOWN_LH_INDICES: dict[str, int] = {
+    # These indices are for the MMP_in_MNI_corr.nii.gz NIfTI from figshare
+    # (https://ndownloader.figshare.com/files/5594363), where LH parcels are
+    # labelled 1–180 and RH = LH + 180. If you use a different atlas version
+    # (e.g. the HCP-MMP1 .dlabel.nii surface file) the indices will differ.
+    #
+    # To verify: load the NIfTI, extract unique non-zero labels, and cross-
+    # reference against Table S1 of Glasser et al. 2016 (Nature).
+    #
+    # ⚠ UNVERIFIED: "MST": 2  — in the surface parcellation, parcel 2 is
+    #   typically near V1. MST is lateral-temporal and may be higher-indexed.
+    #   If atlas coverage reports say MST is empty, check this value first.
+    #
+    # ⚠ UNVERIFIED: "p24": 179  — p24 (posterior BA24, perigenual ACC) is a
+    #   medial-wall parcel. An LH index of 179 puts it at the very boundary of
+    #   the 1–180 range, which is implausible for a medial cingulate area.
+    #   Recommended: run `coverage_report()` after loading the atlas and
+    #   verify the p24 voxel count is non-zero. Expected LH index ≈ 30–70.
     "V1": 1,
-    "MST": 2,
+    "MST": 2,    # ⚠ unverified — see note above
     "V2": 4,
     "V3": 5,
     "V4": 6,
@@ -60,13 +77,13 @@ KNOWN_LH_INDICES: dict[str, int] = {
     "46": 84,
     "a9-46v": 85,
     "9-46d": 86,
+    "MI": 109,
     "PI": 110,
     "AVI": 111,
     "AAIC": 112,
     "V4t": 156,
     "FST": 157,
-    "p24": 179,
-    "MI": 109,
+    "p24": 179,  # ⚠ unverified — see note above; expected ≈ 30–70
 }
 
 

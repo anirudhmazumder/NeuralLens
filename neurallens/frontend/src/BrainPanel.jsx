@@ -40,6 +40,11 @@ const REGION_DESCRIPTIONS = {
   NAcc:        'Reward anticipation',
 }
 
+// These three are subcortical structures (not in HCP-MMP1 cortical atlas).
+// Scores are estimated by the Colab API using the Harvard-Oxford subcortical
+// atlas (fetch_atlas_harvard_oxford 'sub-maxprob-thr25-2mm').
+const SUBCORTICAL_REGIONS = new Set(['Hippocampus', 'Amygdala', 'NAcc'])
+
 const SEVERITY_STYLES = {
   block: { bg: '#fef2f2', border: '#fca5a5', text: '#b91c1c', icon: '🚫' },
   warn:  { bg: '#fffbeb', border: '#fcd34d', text: '#92400e', icon: '⚠️' },
@@ -47,6 +52,10 @@ const SEVERITY_STYLES = {
 }
 
 const KEY_TRIO = ['Amygdala', 'Hippocampus', 'NAcc']
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, Number(v) || 0))
+}
 
 export default function BrainPanel({ regions, ethicsFlags = [], intent = 'engage', intentReward = null }) {
   const sortedRegions = useMemo(() => {
@@ -98,7 +107,7 @@ export default function BrainPanel({ regions, ethicsFlags = [], intent = 'engage
       {/* Key trio: Amygdala, Hippocampus, NAcc */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
         {KEY_TRIO.map(region => {
-          const val = regions[region] ?? 0
+          const val = clamp01(regions[region] ?? 0)
           const cat = REGION_CATEGORIES[region]
           const color = CATEGORY_COLORS[cat]
           const isWarning = (region === 'Amygdala' && val > 0.60) || (region === 'NAcc' && val > 0.70)
@@ -108,15 +117,19 @@ export default function BrainPanel({ regions, ethicsFlags = [], intent = 'engage
               border: `1px solid ${isWarning ? '#f87171' : '#334155'}`,
               borderRadius: 8, padding: '10px 12px', textAlign: 'center',
             }}>
-              <div style={{ color: '#94a3b8', fontSize: 10, marginBottom: 4 }}>
+              <div style={{ color: '#94a3b8', fontSize: 10, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
                 {region}
+                <span style={{
+                  background: '#1e3a5f', color: '#60a5fa',
+                  fontSize: 8, padding: '1px 4px', borderRadius: 3,
+                  fontFamily: 'monospace', letterSpacing: '0.03em',
+                }}>sub</span>
               </div>
               <div style={{
                 fontSize: 22, fontWeight: 800, fontFamily: 'monospace',
                 color: isWarning ? '#f87171' : color,
               }}>
-                {(val * 100).toFixed(0)}
-                <span style={{ fontSize: 11, fontWeight: 400 }}>%</span>
+                {val.toFixed(3)}
               </div>
               <div style={{ color: '#475569', fontSize: 9, marginTop: 2 }}>
                 {REGION_DESCRIPTIONS[region]}
@@ -129,20 +142,28 @@ export default function BrainPanel({ regions, ethicsFlags = [], intent = 'engage
       {/* All 9 region bars */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {sortedRegions.map(([region, val]) => {
+          const nval = clamp01(val)
           const cat = REGION_CATEGORIES[region] || 'engagement'
           const color = CATEGORY_COLORS[cat]
-          const pct = Math.round(val * 100)
+          const pct = Math.round(nval * 100)
           return (
             <div key={region}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-                <span style={{ color: '#cbd5e1', fontSize: 11 }}>
+                <span style={{ color: '#cbd5e1', fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}>
                   {region}
-                  <span style={{ color: '#475569', marginLeft: 6, fontSize: 10 }}>
+                  {SUBCORTICAL_REGIONS.has(region) && (
+                    <span style={{
+                      background: '#1e3a5f', color: '#60a5fa',
+                      fontSize: 8, padding: '1px 4px', borderRadius: 3,
+                      fontFamily: 'monospace',
+                    }}>sub</span>
+                  )}
+                  <span style={{ color: '#475569', fontSize: 10 }}>
                     {REGION_DESCRIPTIONS[region]}
                   </span>
                 </span>
                 <span style={{ color, fontSize: 11, fontFamily: 'monospace' }}>
-                  {pct}%
+                  {nval.toFixed(3)}
                 </span>
               </div>
               <div style={{ height: 5, background: '#1e293b', borderRadius: 3, overflow: 'hidden' }}>
@@ -165,6 +186,21 @@ export default function BrainPanel({ regions, ethicsFlags = [], intent = 'engage
             <span style={{ color: '#64748b', fontSize: 10 }}>{cat}</span>
           </div>
         ))}
+      </div>
+
+      {/* Atlas source footnote */}
+      <div style={{ borderTop: '1px solid #1e293b', paddingTop: 8 }}>
+        <div style={{ color: '#334155', fontSize: 9, lineHeight: 1.5 }}>
+          <span style={{
+            background: '#1e3a5f', color: '#60a5fa',
+            fontSize: 8, padding: '1px 4px', borderRadius: 3,
+            fontFamily: 'monospace', marginRight: 5,
+          }}>sub</span>
+          Hippocampus, Amygdala &amp; NAcc are subcortical structures estimated via
+          the Harvard-Oxford subcortical atlas (thr25-2mm) in the TRIBE API —
+          not from the HCP-MMP1 cortical parcellation.
+          Cortical regions (FFA, V4, MT+, PFC, ACC, Insula) use Glasser 2016.
+        </div>
       </div>
 
       {/* Ethics flags */}

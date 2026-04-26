@@ -50,6 +50,7 @@ export default function App() {
   const [error, setError] = useState(null)
   const [previewTab, setPreviewTab] = useState('after')  // 'before' | 'after'
   const [jobIdForPreview, setJobIdForPreview] = useState(null)
+  const [currentJobId, setCurrentJobId] = useState(null)
   const [memoryStats, setMemoryStats] = useState(null)
   const [events, setEvents] = useState([])               // raw SSE events for AgentVisionPanel
   const [agentVisionActive, setAgentVisionActive] = useState(false)
@@ -57,6 +58,11 @@ export default function App() {
   const [brainRegions, setBrainRegions] = useState(null)
   const [ethicsFlags, setEthicsFlags] = useState([])
   const [intentReward, setIntentReward] = useState(null)
+  const [gazeRegions, setGazeRegions] = useState([])
+  const [gazeOverlayBase64, setGazeOverlayBase64] = useState('')
+  const [analysisView, setAnalysisView] = useState('brain') // brain | deepgaze
+  const [backendInfo, setBackendInfo] = useState(null)
+  const [pendingApproval, setPendingApproval] = useState(null)
 
   const esRef = useRef(null)
   const feedRef = useRef(null)
@@ -85,9 +91,26 @@ export default function App() {
     if (status === 'running') setAgentVisionActive(true)
   }, [status])
 
+  useEffect(() => {
+    fetch('/health')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => data && setBackendInfo(data))
+      .catch(() => {})
+  }, [])
+
   const handleEvent = useCallback((type, data) => {
-    // Accumulate all raw events for AgentVisionPanel
-    setEvents(prev => [...prev, { type, data }])
+    // Accumulate all raw events for AgentVisionPanel.
+    // Keep a single live "scoring_wait" event and update it in place.
+    setEvents(prev => {
+      const stamped = { type, data, ts: Date.now() }
+      if (type === 'progress' && data?.status === 'scoring_wait') {
+        const last = prev[prev.length - 1]
+        if (last?.type === 'progress' && last?.data?.status === 'scoring_wait') {
+          return [...prev.slice(0, -1), { ...stamped, ts: last.ts ?? stamped.ts }]
+        }
+      }
+      return [...prev, stamped]
+    })
     if (type === 'progress') {
       const { status: s } = data
 
@@ -99,6 +122,7 @@ export default function App() {
       }
 
       if (s === 'iteration_complete') {
+        setPendingApproval(null)
         setCurrentIter(data.iteration_count)
         setChartData(prev => [...prev, buildChartPoint(data.iteration_count, data.score)])
         setFeed(prev => [...prev, {
@@ -110,18 +134,34 @@ export default function App() {
           accepted: data.accepted,
         }])
         if (data.accepted) {
-          setAcceptedEdits(prev => [...prev, data.edit])
+          setAcceptedEdits(prev => [...prev, { ...data.edit, iteration: data.iteration_count }])
         }
         return
       }
 
       // Generic status messages (scraping / scoring / proposing)
-      if (['scraping', 'scoring', 'proposing'].includes(s)) {
+      if (['scraping', 'scoring', 'scoring_wait', 'proposing'].includes(s)) {
         setFeed(prev => {
           const last = prev[prev.length - 1]
-          if (last?.kind === 'status' && last.status === s) return prev
+          if (s === 'scoring_wait') {
+            const nextItem = {
+              kind: 'status',
+              status: 'scoring_wait',
+              message: data.message,
+              wait_started_at: data.wait_started_at,
+              timeout_seconds: data.timeout_seconds,
+            }
+            if (last?.kind === 'status' && last.status === 'scoring_wait') {
+              return [...prev.slice(0, -1), nextItem]
+            }
+            return [...prev, nextItem]
+          }
+          if (last?.kind === 'status' && last.status === s && last.message === data.message) return prev
           return [...prev, { kind: 'status', status: s, message: data.message }]
         })
+      }
+      if (s === 'approval_needed') {
+        setPendingApproval(data)
       }
     }
 
@@ -131,7 +171,16 @@ export default function App() {
       if (data.intent_reward != null) setIntentReward(data.intent_reward)
     }
 
+    if (type === 'gaze') {
+      setGazeRegions(data.gaze_regions || [])
+      if (data.gaze_overlay_base64) {
+        setGazeOverlayBase64(data.gaze_overlay_base64)
+      }
+    }
+
     if (type === 'complete') {
+      setPendingApproval(null)
+      setCurrentJobId(null)
       setStatus('complete')
       setFinalScore(data.final_score)
       if (data.accepted_edits) setAcceptedEdits(data.accepted_edits)
@@ -146,6 +195,8 @@ export default function App() {
     }
 
     if (type === 'error') {
+      setPendingApproval(null)
+      setCurrentJobId(null)
       setStatus('error')
       setError(data.message)
       esRef.current?.close()
@@ -201,10 +252,15 @@ export default function App() {
     setFinalScore(null)
     setAcceptedEdits([])
     setJobIdForPreview(null)
+    setCurrentJobId(null)
+    setPendingApproval(null)
     setPreviewTab('after')
     setBrainRegions(null)
     setEthicsFlags([])
     setIntentReward(null)
+    setGazeRegions([])
+    setGazeOverlayBase64('')
+    setAnalysisView('brain')
 
     try {
       const res = await fetch(`${API}/optimize`, {
@@ -214,6 +270,7 @@ export default function App() {
       })
       if (!res.ok) throw new Error(`Server error: HTTP ${res.status}`)
       const { job_id } = await res.json()
+      setCurrentJobId(job_id)
 
       setStatus('running')
       const es = new EventSource(`${API}/job/${job_id}/stream`)
@@ -223,11 +280,10 @@ export default function App() {
         const { type, data } = JSON.parse(e.data)
         handleEvent(type, data)
       }
-      es.onerror = () => {
+      attachResilientErrorHandler(es, () => {
         setStatus('error')
         setError('Connection to server lost. Is the backend running?')
-        es.close()
-      }
+      })
     } catch (err) {
       setError(err.message)
       setStatus('idle')
@@ -247,7 +303,12 @@ export default function App() {
     setFinalScore(null)
     setAcceptedEdits([])
     setJobIdForPreview(null)
+    setCurrentJobId(null)
+    setPendingApproval(null)
     setHtmlJobId(null)
+    setGazeRegions([])
+    setGazeOverlayBase64('')
+    setAnalysisView('brain')
 
     try {
       const res = await fetch(`${API}/optimize-html`, {
@@ -263,6 +324,7 @@ export default function App() {
       const { job_id } = await res.json()
 
       setHtmlJobId(job_id)
+      setCurrentJobId(job_id)
       setStatus('running')
       const es = new EventSource(`${API}/job/${job_id}/stream`)
       esRef.current = es
@@ -272,11 +334,10 @@ export default function App() {
         handleEvent(type, data)
         if (type === 'complete') setJobIdForPreview(job_id)
       }
-      es.onerror = () => {
+      attachResilientErrorHandler(es, () => {
         setStatus('error')
         setError('Connection to server lost. Is the backend running?')
-        es.close()
-      }
+      })
     } catch (err) {
       setError(err.message)
       setStatus('idle')
@@ -293,6 +354,23 @@ export default function App() {
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
+  }
+
+  const submitApprovalDecision = async (accept) => {
+    if (!currentJobId || !pendingApproval?.iteration_count) return
+    try {
+      await fetch(`${API}/job/${currentJobId}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          iteration: pendingApproval.iteration_count,
+          accept,
+        }),
+      })
+      setPendingApproval(null)
+    } catch (err) {
+      setError(err.message || 'Failed to submit decision')
+    }
   }
 
   const progress = maxIterations > 0 ? (currentIter / maxIterations) * 100 : 0
@@ -349,6 +427,12 @@ export default function App() {
         )}
 
         <div className="ml-auto">
+          {backendInfo && (
+            <div className="text-[11px] text-gray-500 mb-1 text-right">
+              TRIBE: <span className={backendInfo.tribe_live ? 'text-green-400' : 'text-gray-400'}>{backendInfo.tribe_live ? 'live' : 'stub'}</span>{' '}
+              · Agent: <span className={backendInfo.openai_live ? 'text-green-400' : 'text-yellow-400'}>{backendInfo.openai_live ? (backendInfo.model || 'live') : 'stub'}</span>
+            </div>
+          )}
           {status === 'running' && (
             <span className="flex items-center gap-2 text-sm text-cyan-400">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
@@ -369,6 +453,13 @@ export default function App() {
           )}
         </div>
       </header>
+
+      {activeTab === 'optimize' && status === 'running' && pendingApproval && (
+        <ApprovalBar
+          pending={pendingApproval}
+          onDecision={submitApprovalDecision}
+        />
+      )}
 
       {/* ── Build tab ── */}
       {activeTab === 'build' && (
@@ -650,15 +741,49 @@ export default function App() {
             )}
           </div>
 
-          {/* Brain activation panel */}
-          {(brainRegions || status === 'running' || status === 'complete') && (
-            <div className="flex-shrink-0">
-              <BrainPanel
-                regions={brainRegions}
-                ethicsFlags={ethicsFlags}
-                intent={intent}
-                intentReward={intentReward}
-              />
+          {/* Analysis panels: Brain vs DeepGaze */}
+          {(brainRegions || gazeRegions.length > 0 || status === 'running' || status === 'complete') && (
+            <div className="flex-shrink-0 bg-gray-900 border border-gray-800 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+                  Neural Analysis
+                </h3>
+                <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs">
+                  <button
+                    onClick={() => setAnalysisView('brain')}
+                    className={`px-3 py-1.5 font-medium transition ${
+                      analysisView === 'brain'
+                        ? 'bg-violet-600 text-white'
+                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                    }`}
+                  >
+                    Brain
+                  </button>
+                  <button
+                    onClick={() => setAnalysisView('deepgaze')}
+                    className={`px-3 py-1.5 font-medium transition ${
+                      analysisView === 'deepgaze'
+                        ? 'bg-violet-600 text-white'
+                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                    }`}
+                  >
+                    DeepGaze
+                  </button>
+                </div>
+              </div>
+              {analysisView === 'brain' ? (
+                <BrainPanel
+                  regions={brainRegions}
+                  ethicsFlags={ethicsFlags}
+                  intent={intent}
+                  intentReward={intentReward}
+                />
+              ) : (
+                <DeepGazePanel
+                  regions={gazeRegions}
+                  overlayBase64={gazeOverlayBase64}
+                />
+              )}
             </div>
           )}
 
@@ -673,9 +798,14 @@ export default function App() {
               <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
                 Accepted Changes — Before / After
               </h3>
-              <div className="flex flex-col gap-3 max-h-72 overflow-y-auto pr-1">
+              <div className="flex flex-col gap-3 max-h-[520px] overflow-y-auto pr-1">
                 {acceptedEdits.map((edit, idx) => (
-                  <DiffCard key={idx} edit={edit} index={idx} />
+                  <DiffCard
+                    key={idx}
+                    edit={edit}
+                    index={idx}
+                    jobId={currentJobId || jobIdForPreview}
+                  />
                 ))}
               </div>
             </div>
@@ -715,6 +845,9 @@ export default function App() {
               jobId={jobIdForPreview}
               tab={previewTab}
               onTab={setPreviewTab}
+              baselineScore={baselineScore}
+              finalScore={finalScore}
+              acceptedEdits={acceptedEdits}
             />
           )}
 
@@ -729,7 +862,7 @@ export default function App() {
                     ['🎬', 'Simulates a human scrolling your page via Playwright'],
                     ['🧬', 'Passes video + text + audio to TRIBE v2 brain encoder'],
                     ['🧠', 'Scores 9 HCP-MMP1 regions: Amygdala, Hippocampus, NAcc + 6 more'],
-                    ['🤖', 'Claude agent proposes targeted text edits based on gaze + brain data'],
+                    ['🤖', 'AI agent proposes targeted text edits based on gaze + brain data'],
                     ['🔁', 'Iterates using intent-aware neural reward signal'],
                     ['📈', 'Accepts edits that improve brain engagement within ethical guardrails'],
                   ].map(([icon, text]) => (
@@ -751,6 +884,135 @@ export default function App() {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
+function ApprovalBar({ pending, onDecision }) {
+  const [expanded, setExpanded] = useState(true)
+  const edit = pending.edit || {}
+  const delta = Number(pending.score_delta ?? 0)
+  const positive = delta >= 0
+  const roiDeltas = pending.roi_deltas || {}
+  const expectedROI = edit.expected_roi_impact || {}
+  const actionType = edit.action_type || 'edit'
+  const actionIcon = ACTION_ICONS[actionType] || '🔧'
+  const truncate = (s, n = 220) => (s && s.length > n ? s.slice(0, n) + '…' : s)
+  const original = edit.original ?? edit.html_original ?? ''
+  const replacement = edit.replacement ?? edit.html_replacement ?? ''
+
+  return (
+    <div className="px-4 py-3 border-b-2 border-violet-700/60 bg-gradient-to-r from-violet-950/60 via-gray-950/80 to-cyan-950/40 sticky top-0 z-30 backdrop-blur">
+      <div className="max-w-6xl mx-auto flex flex-col gap-2">
+        {/* Top row */}
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-violet-300">
+            <span className="w-2 h-2 rounded-full bg-violet-400 animate-pulse" />
+            Run paused — your decision required
+          </span>
+          <span className="text-[10px] text-gray-500 px-2 py-0.5 rounded-full border border-gray-700">
+            Iter {pending.iteration_count}/{pending.max_iterations}
+          </span>
+          <span className="text-xs text-gray-300 flex items-center gap-1.5">
+            <span>{actionIcon}</span>
+            <span className="capitalize font-medium">{actionType.replace(/_/g, ' ')}</span>
+          </span>
+          <span className="text-xs text-gray-400 font-mono">
+            {Number(pending.current_overall ?? 0).toFixed(4)}
+            {' → '}
+            <span className={positive ? 'text-green-400' : 'text-red-400'}>
+              {Number(pending.proposed_overall ?? 0).toFixed(4)}
+              {' '}({positive ? '+' : ''}{delta.toFixed(4)})
+            </span>
+          </span>
+          <button
+            onClick={() => setExpanded(v => !v)}
+            className="text-[10px] text-gray-500 hover:text-gray-300 underline cursor-pointer"
+          >
+            {expanded ? 'Hide details' : 'Show details'}
+          </button>
+          <div className="ml-auto flex gap-2">
+            <button
+              onClick={() => onDecision(false)}
+              className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-700/60 text-red-300 hover:bg-red-900/40 transition cursor-pointer"
+            >
+              ✗ Reject
+            </button>
+            <button
+              onClick={() => onDecision(true)}
+              className="px-4 py-1.5 text-xs font-semibold rounded-lg bg-green-600/80 hover:bg-green-500 text-white transition cursor-pointer shadow-md shadow-green-900/40"
+            >
+              ✓ Accept
+            </button>
+          </div>
+        </div>
+
+        {/* Details */}
+        {expanded && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
+            {/* Diff */}
+            <div className="lg:col-span-2 flex flex-col gap-1.5">
+              {edit.target && (
+                <div className="text-[10px] text-gray-500">
+                  Target: <span className="text-gray-300">{edit.target}</span>
+                  {edit.html_selector && (
+                    <span className="ml-2 font-mono text-violet-400">{edit.html_selector}</span>
+                  )}
+                </div>
+              )}
+              {original && (
+                <div className="line-through text-red-400/80 bg-red-950/30 border border-red-900/40 px-2.5 py-2 rounded leading-relaxed break-words">
+                  {truncate(original)}
+                </div>
+              )}
+              {replacement && (
+                <div className="text-green-300 bg-green-950/30 border border-green-900/40 px-2.5 py-2 rounded leading-relaxed break-words">
+                  {truncate(replacement)}
+                </div>
+              )}
+              {edit.reasoning && (
+                <div className="text-gray-400 italic leading-relaxed pt-1">
+                  💭 {truncate(edit.reasoning, 320)}
+                </div>
+              )}
+            </div>
+
+            {/* Score breakdown */}
+            <div className="flex flex-col gap-2">
+              <div className="bg-gray-900/60 border border-gray-800 rounded-lg p-2.5">
+                <div className="text-[10px] text-gray-500 uppercase tracking-wide mb-1">
+                  ROI deltas (predicted vs measured)
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 font-mono text-[11px]">
+                  {['language', 'attention', 'visual'].map(k => {
+                    const measured = Number(roiDeltas[k] ?? 0)
+                    const predicted = Number(expectedROI[k] ?? 0)
+                    return (
+                      <div key={k} className="bg-gray-950 rounded px-1.5 py-1">
+                        <div className="text-[9px] text-gray-500 capitalize">{k}</div>
+                        <div className={measured >= 0 ? 'text-green-400' : 'text-red-400'}>
+                          {measured >= 0 ? '+' : ''}{measured.toFixed(3)}
+                        </div>
+                        <div className="text-[9px] text-gray-600">
+                          pred {predicted >= 0 ? '+' : ''}{predicted.toFixed(2)}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+              {pending.default_decision && (
+                <div className="text-[10px] text-gray-500">
+                  Auto-suggestion: <span className={
+                    pending.default_decision === 'accept' ? 'text-green-400' : 'text-red-400'
+                  }>{pending.default_decision}</span>
+                  {' '}(based on score delta)
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function FeedItem({ item }) {
   if (item.kind === 'baseline') {
     return (
@@ -764,6 +1026,9 @@ function FeedItem({ item }) {
   }
 
   if (item.kind === 'status') {
+    if (item.status === 'scoring_wait') {
+      return <ScoringWaitStatus item={item} />
+    }
     return (
       <div className="px-3 py-1.5 text-xs text-gray-500 flex items-center gap-2">
         <span className="animate-spin inline-block">⟳</span>
@@ -808,9 +1073,38 @@ function FeedItem({ item }) {
   return null
 }
 
-function DiffCard({ edit, index }) {
+function ScoringWaitStatus({ item }) {
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000))
+  useEffect(() => {
+    const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const startedAt = Number(item.wait_started_at || 0)
+  const timeout = Math.max(1, Number(item.timeout_seconds || 90))
+  const elapsed = startedAt > 0 ? Math.max(0, nowSec - Math.floor(startedAt)) : 0
+  const remaining = Math.max(0, timeout - elapsed)
+
+  return (
+    <div className="px-3 py-1.5 text-xs text-gray-500 flex items-center gap-2">
+      <span className="animate-spin inline-block">⟳</span>
+      <span>
+        {item.message} Timeout in ~{remaining}s (elapsed {elapsed}s).
+      </span>
+    </div>
+  )
+}
+
+function DiffCard({ edit, index, jobId }) {
   const maxLen = 140
   const truncate = (s) => s && s.length > maxLen ? s.slice(0, maxLen) + '…' : s
+  const [thumbError, setThumbError] = useState(false)
+  const [showThumb, setShowThumb] = useState(true)
+  const iter = edit.iteration
+
+  const thumbSrc = (jobId && iter)
+    ? `/job/${jobId}/iteration/${iter}/screenshot`
+    : null
 
   return (
     <div className="text-xs bg-gray-800/50 rounded-lg p-3 border border-gray-700/40">
@@ -819,6 +1113,11 @@ function DiffCard({ edit, index }) {
         <span className="capitalize text-gray-200 font-semibold">
           {(edit.action_type || '').replace(/_/g, ' ')}
         </span>
+        {iter != null && (
+          <span className="text-[10px] font-mono text-gray-500 bg-gray-900/60 px-1.5 py-0.5 rounded border border-gray-700/40">
+            iter {iter}
+          </span>
+        )}
         {edit.target && (
           <span className="text-gray-500 truncate max-w-[200px]" title={edit.target}>
             → {edit.target}
@@ -831,22 +1130,52 @@ function DiffCard({ edit, index }) {
         )}
       </div>
 
-      {edit.original && (
-        <div className="flex flex-col gap-1">
-          <div className="line-through text-red-400/80 bg-red-950/30 border border-red-900/30 px-2 py-1.5 rounded break-words leading-relaxed">
-            {truncate(edit.original)}
-          </div>
-          <div className="text-green-300/90 bg-green-950/30 border border-green-900/30 px-2 py-1.5 rounded break-words leading-relaxed">
-            {truncate(edit.replacement)}
-          </div>
-        </div>
-      )}
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_180px] gap-3">
+        <div className="min-w-0">
+          {edit.original && (
+            <div className="flex flex-col gap-1">
+              <div className="line-through text-red-400/80 bg-red-950/30 border border-red-900/30 px-2 py-1.5 rounded break-words leading-relaxed">
+                {truncate(edit.original)}
+              </div>
+              <div className="text-green-300/90 bg-green-950/30 border border-green-900/30 px-2 py-1.5 rounded break-words leading-relaxed">
+                {truncate(edit.replacement)}
+              </div>
+            </div>
+          )}
 
-      {edit.reasoning && (
-        <div className="text-gray-500 mt-2 italic leading-relaxed">
-          {truncate(edit.reasoning)}
+          {edit.reasoning && (
+            <div className="text-gray-500 mt-2 italic leading-relaxed">
+              {truncate(edit.reasoning)}
+            </div>
+          )}
         </div>
-      )}
+
+        {/* Iteration thumbnail — visual proof of the rendered page state */}
+        {thumbSrc && showThumb && !thumbError && (
+          <div className="relative group rounded overflow-hidden border border-violet-900/30 bg-gray-950">
+            <a href={thumbSrc} target="_blank" rel="noreferrer" title="Open full screenshot">
+              <img
+                src={thumbSrc}
+                alt={`Iteration ${iter} render`}
+                className="block w-full h-[180px] object-cover object-top"
+                onError={() => setThumbError(true)}
+              />
+            </a>
+            <div className="absolute top-1 left-1 pointer-events-none">
+              <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-violet-800/90 text-violet-100 border border-violet-700">
+                AFTER iter {iter}
+              </span>
+            </div>
+            <button
+              onClick={() => setShowThumb(false)}
+              className="absolute top-1 right-1 text-[9px] px-1.5 py-0.5 rounded bg-black/70 text-gray-300 border border-gray-700 opacity-0 group-hover:opacity-100 transition cursor-pointer"
+              title="Hide thumbnail"
+            >
+              ×
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -906,13 +1235,14 @@ function SummaryCard({ baseline, final, iterations, accepted }) {
 }
 
 function ScoreStat({ label, value, highlight }) {
+  const v = Math.max(0, Math.min(1, Number(value) || 0))
   return (
     <div className="text-center">
       <div className={`text-3xl font-bold ${highlight ? 'text-violet-300' : 'text-gray-300'}`}>
-        {(value * 100).toFixed(1)}
+        {v.toFixed(3)}
       </div>
       <div className="text-xs text-gray-400 mt-1">{label}</div>
-      <div className="text-[10px] text-gray-600">× 100</div>
+      <div className="text-[10px] text-gray-600">normalized 0-1</div>
     </div>
   )
 }
@@ -993,101 +1323,335 @@ function MemoryPanel({ stats }) {
   )
 }
 
-function PreviewPanel({ jobId, tab, onTab }) {
+function PreviewPanel({ jobId, tab, onTab, baselineScore, finalScore, acceptedEdits = [] }) {
+  // Modes:
+  //   "split"   – side-by-side, synchronized scroll (default, the most useful)
+  //   "slider"  – classic before/after photo slider with draggable divider
+  //   "toggle"  – legacy single-image tab (Before | After)
+  const [mode, setMode] = useState('split')
   const [imgError, setImgError] = useState({ before: false, after: false })
   const [imgLoaded, setImgLoaded] = useState({ before: false, after: false })
+  const [sliderPct, setSliderPct] = useState(50)
+  const beforeBoxRef = useRef(null)
+  const afterBoxRef = useRef(null)
+  const sliderBoxRef = useRef(null)
+  const isDraggingRef = useRef(false)
 
   const beforeSrc = `/job/${jobId}/before-screenshot`
   const afterSrc  = `/job/${jobId}/after-screenshot`
 
+  const overallDelta = (finalScore?.overall_score ?? 0) - (baselineScore?.overall_score ?? 0)
+  const pct = baselineScore?.overall_score
+    ? (overallDelta / baselineScore.overall_score) * 100
+    : 0
+
+  // Synchronized scroll for split mode — scrolling either pane scrolls the other
+  // proportionally (handles different image heights gracefully).
+  useEffect(() => {
+    if (mode !== 'split') return
+    const a = beforeBoxRef.current
+    const b = afterBoxRef.current
+    if (!a || !b) return
+    let lock = false
+    const handler = (src, dst) => () => {
+      if (lock) return
+      lock = true
+      const ratio = src.scrollTop / Math.max(src.scrollHeight - src.clientHeight, 1)
+      dst.scrollTop = ratio * Math.max(dst.scrollHeight - dst.clientHeight, 1)
+      requestAnimationFrame(() => { lock = false })
+    }
+    const onA = handler(a, b)
+    const onB = handler(b, a)
+    a.addEventListener('scroll', onA, { passive: true })
+    b.addEventListener('scroll', onB, { passive: true })
+    return () => {
+      a.removeEventListener('scroll', onA)
+      b.removeEventListener('scroll', onB)
+    }
+  }, [mode, imgLoaded.before, imgLoaded.after])
+
+  // Slider drag — pointer-anywhere-on-strip semantics, with global mouseup.
+  useEffect(() => {
+    if (mode !== 'slider') return
+    const move = (e) => {
+      if (!isDraggingRef.current) return
+      const box = sliderBoxRef.current
+      if (!box) return
+      const rect = box.getBoundingClientRect()
+      const x = (e.touches?.[0]?.clientX ?? e.clientX) - rect.left
+      const ratio = Math.min(Math.max(x / rect.width, 0), 1)
+      setSliderPct(ratio * 100)
+    }
+    const up = () => { isDraggingRef.current = false }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+    window.addEventListener('touchmove', move, { passive: false })
+    window.addEventListener('touchend', up)
+    return () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      window.removeEventListener('touchmove', move)
+      window.removeEventListener('touchend', up)
+    }
+  }, [mode])
+
+  const onBeforeImgLoad = () => setImgLoaded(s => ({ ...s, before: true }))
+  const onAfterImgLoad  = () => setImgLoaded(s => ({ ...s, after: true }))
+
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex-shrink-0">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
-          Optimized Page Preview
-        </h3>
-        {/* Tab switcher */}
-        <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs">
-          {['before', 'after'].map(t => (
-            <button
-              key={t}
-              onClick={() => onTab(t)}
-              className={`px-3 py-1.5 font-medium transition capitalize ${
-                tab === t
-                  ? t === 'after'
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div className="flex items-center gap-3">
+          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+            Before / After
+          </h3>
+          {finalScore && baselineScore && (
+            <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+              overallDelta >= 0
+                ? 'bg-green-900/30 border-green-700/40 text-green-300'
+                : 'bg-red-900/30 border-red-700/40 text-red-300'
+            }`}>
+              overall {baselineScore.overall_score?.toFixed(4)} → {finalScore.overall_score?.toFixed(4)}
+              {' '}({overallDelta >= 0 ? '+' : ''}{pct.toFixed(1)}%)
+            </span>
+          )}
+          {acceptedEdits.length > 0 && (
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded border bg-violet-900/30 border-violet-700/40 text-violet-300">
+              {acceptedEdits.length} accepted edit{acceptedEdits.length === 1 ? '' : 's'} applied
+            </span>
+          )}
+        </div>
+
+        {/* Mode switcher */}
+        <div className="flex items-center gap-2">
+          <div className="flex rounded-lg overflow-hidden border border-gray-700 text-[10px]">
+            {[
+              { id: 'split',  label: '⬛⬜ Split' },
+              { id: 'slider', label: '⇆ Slider' },
+              { id: 'toggle', label: '⇄ Toggle' },
+            ].map(opt => (
+              <button
+                key={opt.id}
+                onClick={() => setMode(opt.id)}
+                className={`px-2.5 py-1 font-medium transition ${
+                  mode === opt.id
                     ? 'bg-violet-600 text-white'
-                    : 'bg-gray-700 text-white'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
-              }`}
-            >
-              {t === 'after' ? '✨ After' : '📄 Before'}
-            </button>
+                    : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* SPLIT MODE — side-by-side with synced scroll */}
+      {mode === 'split' && (
+        <div className="grid grid-cols-2 gap-3">
+          {[
+            { side: 'before', src: beforeSrc, ref: beforeBoxRef, label: 'BEFORE — original', badge: 'bg-gray-800/90 text-gray-300 border-gray-700', onLoad: onBeforeImgLoad },
+            { side: 'after',  src: afterSrc,  ref: afterBoxRef,  label: 'AFTER — neural-optimized', badge: 'bg-violet-800/90 text-violet-100 border-violet-700', onLoad: onAfterImgLoad },
+          ].map(({ side, src, ref, label, badge, onLoad }) => (
+            <div key={side} className="relative">
+              <div
+                ref={ref}
+                className="rounded-lg overflow-y-auto overflow-x-hidden border border-gray-700/50 bg-gray-950"
+                style={{ height: '560px' }}
+              >
+                {!imgLoaded[side] && !imgError[side] && (
+                  <div className="flex items-center justify-center h-full gap-3 text-gray-500 text-sm">
+                    <span className="animate-spin">⟳</span> Loading {side}…
+                  </div>
+                )}
+                {imgError[side] && (
+                  <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+                    Screenshot not available
+                  </div>
+                )}
+                <img
+                  src={src}
+                  alt={label}
+                  className={`w-full block ${imgLoaded[side] ? '' : 'hidden'}`}
+                  onLoad={onLoad}
+                  onError={() => setImgError(s => ({ ...s, [side]: true }))}
+                />
+              </div>
+              <div className="absolute top-2 left-2 pointer-events-none">
+                <span className={`text-[10px] font-semibold px-2 py-1 rounded border ${badge}`}>
+                  {label}
+                </span>
+              </div>
+            </div>
           ))}
         </div>
-      </div>
+      )}
 
-      {/* Screenshot viewer */}
-      <div className="relative rounded-lg overflow-hidden border border-gray-700/50 bg-gray-950" style={{ height: '520px' }}>
-        {/* Before */}
-        <div className={`absolute inset-0 overflow-y-auto transition-opacity duration-300 ${tab === 'before' ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-          {!imgLoaded.before && !imgError.before && (
-            <div className="flex items-center justify-center h-full gap-3 text-gray-500 text-sm">
-              <span className="animate-spin">⟳</span> Loading original screenshot…
+      {/* SLIDER MODE — classic before/after with draggable vertical divider.
+          Both images are stacked at the same width; the AFTER image is
+          clipped via clip-path to reveal the BEFORE on the right of the
+          handle. This guarantees pixel-perfect alignment regardless of
+          their natural sizes. */}
+      {mode === 'slider' && (
+        <div
+          ref={sliderBoxRef}
+          className="relative rounded-lg overflow-hidden border border-gray-700/50 bg-gray-950 cursor-ew-resize select-none"
+          style={{ height: '560px' }}
+          onMouseDown={(e) => { isDraggingRef.current = true; e.preventDefault() }}
+          onTouchStart={() => { isDraggingRef.current = true }}
+        >
+          {/* Single scroll container; the BEFORE image sets the layout, the
+              AFTER image is absolutely positioned on top at the same size. */}
+          <div className="absolute inset-0 overflow-y-auto overflow-x-hidden">
+            <div className="relative w-full">
+              <img
+                src={beforeSrc}
+                alt="Before"
+                className="w-full block"
+                onLoad={onBeforeImgLoad}
+                onError={() => setImgError(s => ({ ...s, before: true }))}
+                draggable={false}
+              />
+              <img
+                src={afterSrc}
+                alt="After"
+                className="absolute inset-0 w-full block"
+                style={{
+                  clipPath: `inset(0 ${100 - sliderPct}% 0 0)`,
+                  WebkitClipPath: `inset(0 ${100 - sliderPct}% 0 0)`,
+                }}
+                onLoad={onAfterImgLoad}
+                onError={() => setImgError(s => ({ ...s, after: true }))}
+                draggable={false}
+              />
             </div>
-          )}
-          {imgError.before && (
-            <div className="flex items-center justify-center h-full text-gray-600 text-sm">
-              Screenshot not available
-            </div>
-          )}
-          <img
-            src={beforeSrc}
-            alt="Original page"
-            className={`w-full block ${imgLoaded.before ? '' : 'hidden'}`}
-            onLoad={() => setImgLoaded(s => ({ ...s, before: true }))}
-            onError={() => setImgError(s => ({ ...s, before: true }))}
+          </div>
+
+          {/* Divider line + handle (sticky to the viewport so they're always visible) */}
+          <div
+            className="absolute inset-y-0 pointer-events-none"
+            style={{ left: `calc(${sliderPct}% - 1px)`, width: '2px', background: 'rgba(167, 139, 250, 0.85)', boxShadow: '0 0 12px rgba(167, 139, 250, 0.5)' }}
           />
-        </div>
-
-        {/* After */}
-        <div className={`absolute inset-0 overflow-y-auto transition-opacity duration-300 ${tab === 'after' ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-          {!imgLoaded.after && !imgError.after && (
-            <div className="flex items-center justify-center h-full gap-3 text-gray-500 text-sm">
-              <span className="animate-spin">⟳</span> Loading optimized screenshot…
-            </div>
-          )}
-          {imgError.after && (
-            <div className="flex items-center justify-center h-full text-gray-600 text-sm">
-              Optimized screenshot not available
-            </div>
-          )}
-          <img
-            src={afterSrc}
-            alt="Optimized page"
-            className={`w-full block ${imgLoaded.after ? '' : 'hidden'}`}
-            onLoad={() => setImgLoaded(s => ({ ...s, after: true }))}
-            onError={() => setImgError(s => ({ ...s, after: true }))}
-          />
-        </div>
-
-        {/* Badge overlay */}
-        <div className="absolute top-2 left-2 pointer-events-none">
-          {tab === 'before' ? (
-            <span className="text-[10px] font-semibold px-2 py-1 rounded bg-gray-800/90 text-gray-400 border border-gray-700">
-              ORIGINAL
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: `calc(${sliderPct}% - 16px)`,
+              top: '50%',
+              transform: 'translateY(-50%)',
+              width: '32px',
+              height: '32px',
+              borderRadius: '9999px',
+              background: 'rgba(167, 139, 250, 0.95)',
+              boxShadow: '0 0 0 4px rgba(15,23,42,0.7), 0 4px 16px rgba(0,0,0,0.6)',
+              display: 'grid',
+              placeItems: 'center',
+              color: 'white',
+              fontSize: '13px',
+              fontWeight: 700,
+            }}
+          >
+            ⇆
+          </div>
+          <div className="absolute top-2 left-2 pointer-events-none">
+            <span className="text-[10px] font-semibold px-2 py-1 rounded bg-violet-800/90 text-violet-100 border border-violet-700">
+              ✨ AFTER
             </span>
-          ) : (
-            <span className="text-[10px] font-semibold px-2 py-1 rounded bg-violet-800/90 text-violet-200 border border-violet-700">
-              NEURAL-OPTIMIZED
+          </div>
+          <div className="absolute top-2 right-2 pointer-events-none">
+            <span className="text-[10px] font-semibold px-2 py-1 rounded bg-gray-800/90 text-gray-300 border border-gray-700">
+              📄 BEFORE
             </span>
-          )}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* TOGGLE MODE — single image tab (legacy) */}
+      {mode === 'toggle' && (
+        <div>
+          <div className="flex justify-end mb-2">
+            <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs">
+              {['before', 'after'].map(t => (
+                <button
+                  key={t}
+                  onClick={() => onTab(t)}
+                  className={`px-3 py-1.5 font-medium transition capitalize ${
+                    tab === t
+                      ? t === 'after'
+                        ? 'bg-violet-600 text-white'
+                        : 'bg-gray-700 text-white'
+                      : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                  }`}
+                >
+                  {t === 'after' ? '✨ After' : '📄 Before'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="relative rounded-lg overflow-hidden border border-gray-700/50 bg-gray-950" style={{ height: '560px' }}>
+            <div className={`absolute inset-0 overflow-y-auto transition-opacity duration-300 ${tab === 'before' ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+              <img src={beforeSrc} alt="Original" className="w-full block" onLoad={onBeforeImgLoad}
+                   onError={() => setImgError(s => ({ ...s, before: true }))} />
+            </div>
+            <div className={`absolute inset-0 overflow-y-auto transition-opacity duration-300 ${tab === 'after' ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+              <img src={afterSrc} alt="Optimized" className="w-full block" onLoad={onAfterImgLoad}
+                   onError={() => setImgError(s => ({ ...s, after: true }))} />
+            </div>
+            <div className="absolute top-2 left-2 pointer-events-none">
+              {tab === 'before' ? (
+                <span className="text-[10px] font-semibold px-2 py-1 rounded bg-gray-800/90 text-gray-300 border border-gray-700">
+                  ORIGINAL
+                </span>
+              ) : (
+                <span className="text-[10px] font-semibold px-2 py-1 rounded bg-violet-800/90 text-violet-100 border border-violet-700">
+                  NEURAL-OPTIMIZED
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <p className="text-[11px] text-gray-600 mt-2 text-center">
-        Scroll inside the preview to see the full page. Accepted edits were injected into a live Playwright render.
+        {mode === 'split'  && 'Scroll either pane — both stay in sync. The right pane is a fresh Playwright render with all accepted edits applied.'}
+        {mode === 'slider' && 'Drag the handle to wipe between original (right) and optimized (left). Replaced text is softly highlighted.'}
+        {mode === 'toggle' && 'Switch tabs to compare the original page with the neural-optimized render.'}
       </p>
+    </div>
+  )
+}
+
+function DeepGazePanel({ regions, overlayBase64 }) {
+  const top = regions?.[0]
+  return (
+    <div className="bg-gray-950 border border-gray-800 rounded-xl p-4">
+      {!regions?.length ? (
+        <div className="text-xs text-gray-500 text-center py-6">
+          DeepGaze output appears after gaze analysis completes.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <div className="text-xs text-gray-400">
+            Top fixation region: #{top.rank} at {JSON.stringify(top.peak_coords)} · saliency {top.saliency_score?.toFixed?.(3) ?? top.saliency_score}
+          </div>
+          {overlayBase64 ? (
+            <img
+              src={`data:image/png;base64,${overlayBase64}`}
+              alt="DeepGaze overlay"
+              className="w-full rounded-lg border border-gray-700"
+            />
+          ) : (
+            <div className="text-xs text-gray-500">Heatmap overlay not available yet.</div>
+          )}
+          <div className="max-h-36 overflow-y-auto border border-gray-800 rounded-lg p-2 bg-gray-900">
+            {regions.slice(0, 5).map((r) => (
+              <div key={r.rank} className="text-xs text-gray-300 font-mono py-1">
+                #{r.rank} sal={r.saliency_score} bbox={JSON.stringify(r.bbox)}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1105,13 +1669,41 @@ function PatternsTab() {
   const [patterns, setPatterns] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const loadPatterns = useCallback(async (silent = false) => {
+    if (silent) setRefreshing(true)
+    try {
+      const r = await fetch('/patterns')
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const data = await r.json()
+      setPatterns(Array.isArray(data) ? data : [])
+      setError(null)
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setLoading(false)
+      if (silent) setRefreshing(false)
+    }
+  }, [])
 
   useEffect(() => {
-    fetch('/patterns')
-      .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
-      .then(data => { setPatterns(data); setLoading(false) })
-      .catch(err => { setError(String(err)); setLoading(false) })
-  }, [])
+    let active = true
+    const initialLoad = async () => {
+      await loadPatterns(false)
+    }
+    void initialLoad()
+
+    const intervalId = setInterval(() => {
+      if (!active) return
+      void loadPatterns(true)
+    }, 5000)
+
+    return () => {
+      active = false
+      clearInterval(intervalId)
+    }
+  }, [loadPatterns])
 
   if (loading) {
     return (
@@ -1144,9 +1736,17 @@ function PatternsTab() {
             Statistical correlations discovered from {patterns.reduce((s, p) => s + p.sample_count, 0)} optimization experiences
           </p>
         </div>
-        <span className="text-sm font-mono bg-gray-900 border border-gray-800 px-3 py-1.5 rounded-lg text-violet-400">
-          {patterns.length} patterns
-        </span>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void loadPatterns(true)}
+            className="text-xs bg-gray-900 border border-gray-800 px-2.5 py-1.5 rounded-lg text-gray-300 hover:text-white hover:border-gray-700 transition cursor-pointer"
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <span className="text-sm font-mono bg-gray-900 border border-gray-800 px-3 py-1.5 rounded-lg text-violet-400">
+            {patterns.length} patterns
+          </span>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1210,6 +1810,32 @@ function PatternsTab() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// EventSource auto-reconnects on transient drops. We only escalate to the user
+// after sustained failures (>15s of CONNECTING/CLOSED with no data).
+function attachResilientErrorHandler(es, onFinalError) {
+  let timer = null
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) {
+      onFinalError?.()
+      return
+    }
+    if (timer) return
+    timer = setTimeout(() => {
+      if (es.readyState !== EventSource.OPEN) {
+        onFinalError?.()
+        es.close()
+      }
+      timer = null
+    }, 15000)
+  }
+  es.addEventListener('open', () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  })
+}
 
 function buildChartPoint(iteration, score) {
   return {
