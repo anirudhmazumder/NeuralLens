@@ -1,6 +1,11 @@
 """FastAPI application — NeuralLens backend."""
 from __future__ import annotations
 
+# Load .env before anything else so OPENAI_LIVE, TRIBE_LIVE, etc. are available
+from pathlib import Path as _Path
+from dotenv import load_dotenv as _load_dotenv
+_load_dotenv(_Path(__file__).resolve().parent.parent / ".env")
+
 import asyncio
 import base64
 import json
@@ -85,21 +90,32 @@ class GazeAnalysisRequest(BaseModel):
 @app.get("/health")
 async def health():
     tribe_live = os.getenv("TRIBE_LIVE", "false").lower() == "true"
-    agent_live = os.getenv("CLAUDE_LIVE", "false").lower() == "true"
-    mode = "live" if (tribe_live or agent_live) else "stub"
-    return {"status": "ok", "mode": mode, "agent": "claude-sonnet-4-6" if agent_live else "stub"}
+    openai_live = os.getenv("OPENAI_LIVE", "false").lower() == "true"
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
+    return {
+        "status": "ok",
+        "tribe_live": tribe_live,
+        "openai_live": openai_live,
+        "model": model if openai_live else "stub",
+    }
 
 
 # ── Optimization job ───────────────────────────────────────────────────────────
 
 @app.post("/optimize")
 async def start_optimization(req: OptimizeRequest, background_tasks: BackgroundTasks):
+    url = req.url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    if len(url) < 11 or "." not in url.split("//", 1)[-1]:
+        raise HTTPException(status_code=400, detail=f"Invalid URL: {req.url!r}")
+
     job_id = str(uuid.uuid4())
-    job = JobState(job_id=job_id, url=req.url, max_iterations=req.max_iterations, status="running")
+    job = JobState(job_id=job_id, url=url, max_iterations=req.max_iterations, status="running")
     jobs[job_id] = job
 
     loop = OptimizationLoop()
-    background_tasks.add_task(loop.run, req.url, req.max_iterations, job_id, req.intent)
+    background_tasks.add_task(loop.run, url, req.max_iterations, job_id, req.intent)
     return {"job_id": job_id}
 
 

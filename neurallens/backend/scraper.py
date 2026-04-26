@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class PageContent:
     url: str
     text: str
+    html: str
     screenshot_path: str
     video_path: str
     audio_path: Optional[str]
@@ -46,7 +47,7 @@ async def scrape(url: str, out_dir: str) -> PageContent:
         context = await browser.new_context(viewport={"width": 1280, "height": 800})
         page = await context.new_page()
 
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
+        await page.goto(url, wait_until="load", timeout=45_000)
 
         # Full-page screenshot
         await page.screenshot(path=screenshot_path, full_page=True)
@@ -100,6 +101,17 @@ async def scrape(url: str, out_dir: str) -> PageContent:
             }
         """)
 
+        # Cleaned body HTML (scripts/styles/iframes removed) for agent context
+        html = await page.evaluate("""
+            () => {
+                const clone = document.body.cloneNode(true);
+                for (const el of clone.querySelectorAll(
+                    'script,style,noscript,iframe,svg,canvas,video,audio'
+                )) el.remove();
+                return clone.innerHTML.substring(0, 8000);
+            }
+        """)
+
         # Scroll recording: 20 frames over ~10 seconds at 2 fps
         page_height = await page.evaluate("document.documentElement.scrollHeight")
         viewport_h = 800
@@ -139,6 +151,7 @@ async def scrape(url: str, out_dir: str) -> PageContent:
     return PageContent(
         url=url,
         text=text,
+        html=html,
         screenshot_path=screenshot_path,
         video_path=video_path,
         audio_path=audio_path,

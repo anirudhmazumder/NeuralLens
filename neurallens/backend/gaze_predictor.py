@@ -91,11 +91,17 @@ class GazePredictor:
     def _load_model(self) -> None:
         if self._model is not None:
             return
-        import torch
-        from deepgaze_pytorch import DeepGazeIIE  # type: ignore[import-untyped]
-        self._model = DeepGazeIIE(pretrained=True).to(_GAZE_DEVICE)
-        self._model.eval()
-        print(f"[GazePredictor] DeepGaze IIE loaded on {_GAZE_DEVICE}")
+        try:
+            import torch
+            from deepgaze_pytorch import DeepGazeIIE  # type: ignore[import-untyped]
+            self._model = DeepGazeIIE(pretrained=True).to(_GAZE_DEVICE)
+            self._model.eval()
+            print(f"[GazePredictor] DeepGaze IIE loaded on {_GAZE_DEVICE}")
+        except (RuntimeError, OSError, Exception) as exc:
+            # Corrupted checkpoint, missing file, or other load failure — fall back to stub
+            print(f"[GazePredictor] model load failed ({exc.__class__.__name__}: {exc}) — using F-pattern stub")
+            self.live = False
+            self._model = None
 
     # ── Saliency ───────────────────────────────────────────────────────────────
 
@@ -118,6 +124,10 @@ class GazePredictor:
         from PIL import Image as _PILImage
 
         self._load_model()
+        # _load_model may have flipped live=False on failure
+        if not self.live:
+            return _stub_saliency(h, w), h, w
+
         image = np.array(_PILImage.open(screenshot_path).convert("RGB"))
         h_img, w_img = image.shape[:2]
 

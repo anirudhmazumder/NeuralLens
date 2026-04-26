@@ -1,19 +1,11 @@
 """TRIBE v2 multimodal brain-encoding scorer.
 
-Two modes:
-  stub (default) — calls fake_tribe_score, no API keys needed.
-  live  (TRIBE_LIVE=true) — POSTs to a real TRIBE v2 endpoint; if the endpoint
-        returns full voxel/region data the atlas_regions key is populated.
+Always calls the live TRIBE endpoint (TRIBE_ENDPOINT env var).
+POSTs a screenshot PNG + text to /encode and receives 9 HCP-MMP1 region scores.
 
 Gaze weighting (GAZE_LIVE=true):
-  When screenshot_path is provided and GAZE_LIVE=true, the overall_score is
-  reweighted by saliency-weighted text quality using the gaze predictor.
-  Falls back to the base score silently if gaze analysis fails.
-
-Brain region scoring:
-  score_brain_regions(screenshot_path) returns all 9 HCP-MMP1 region activations
-  (FFA, V4, MT+, Hippocampus, PFC, ACC, Amygdala, Insula, NAcc) using the local
-  StubEncoder. This runs in parallel to the main TRIBE score.
+  When screenshot_path is provided and GAZE_LIVE=true, overall_score is
+  reweighted by saliency-weighted text quality. Fails silently.
 """
 from __future__ import annotations
 
@@ -22,15 +14,9 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from stubs import fake_tribe_score
-
-
 class TribeScorer:
     def __init__(self) -> None:
-        self.live = os.getenv("TRIBE_LIVE", "false").lower() == "true"
         self.endpoint = os.getenv("TRIBE_ENDPOINT", "http://localhost:9090/encode")
-        token = os.getenv("TRIBE_TOKEN", "").strip()
-        self.token = token or None
 
     def _encode_url(self) -> str:
         ep = self.endpoint.rstrip("/")
@@ -73,29 +59,31 @@ class TribeScorer:
         return regions
 
     async def _call_live_encode(self, screenshot_path: str, text: str) -> dict[str, float]:
+        """POST to TRIBE endpoint. Falls back to local image encoder on connection failure."""
         import httpx  # type: ignore
 
         url = self._encode_url()
         with open(screenshot_path, "rb") as fh:
             png = fh.read()
 
-        headers = {"Content-Type": "image/png"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Try raw PNG body first (Flask request.data style).
+                r = await client.post(url, content=png, headers={"Content-Type": "image/png"})
+                if r.status_code >= 400:
+                    # Fallback to JSON base64 (common FastAPI shape).
+                    payload = {"image_base64": base64.b64encode(png).decode(), "text": text}
+                    r = await client.post(url, json=payload)
+                r.raise_for_status()
+                data = r.json()
+                # Strip large vertex arrays — we only need region_scores + subcortical
+                data.pop("vertices", None)
+                return self._extract_regions(data)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # First try raw PNG body (Flask request.data style).
-            r = await client.post(url, content=png, headers=headers)
-            if r.status_code >= 400:
-                # Fallback to JSON base64 (common FastAPI shape).
-                payload = {"image_base64": base64.b64encode(png).decode(), "text": text}
-                json_headers = {"Content-Type": "application/json"}
-                if self.token:
-                    json_headers["Authorization"] = f"Bearer {self.token}"
-                r = await client.post(url, json=payload, headers=json_headers)
-            r.raise_for_status()
-            data = r.json()
-        return self._extract_regions(data)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            print(f"[TRIBE] endpoint unreachable ({exc.__class__.__name__}) — using local encoder")
+            from brain_regions import score_screenshot
+            return score_screenshot(screenshot_path)
 
     @staticmethod
     def _regions_to_multimodal_score(regions: dict[str, float], *, audio_path: Optional[str], text: str) -> dict:
@@ -139,16 +127,14 @@ class TribeScorer:
         *,
         screenshot_path: Optional[str] = None,
     ) -> dict:
-        # ── Base TRIBE score ───────────────────────────────────────────────────
-        if not self.live:
-            base = await fake_tribe_score(video_path, text, audio_path)
-        else:
-            if not screenshot_path or not Path(screenshot_path).exists():
-                raise RuntimeError(
-                    "TRIBE_LIVE=true requires a valid screenshot_path for /encode scoring."
-                )
-            regions = await self._call_live_encode(screenshot_path, text)
-            base = self._regions_to_multimodal_score(regions, audio_path=audio_path, text=text)
+        # ── Live TRIBE score (always) ──────────────────────────────────────────
+        if not screenshot_path or not Path(screenshot_path).exists():
+            raise RuntimeError(
+                "TRIBE endpoint requires a valid screenshot_path. "
+                "Ensure TRIBE_ENDPOINT is reachable and a screenshot was taken."
+            )
+        regions = await self._call_live_encode(screenshot_path, text)
+        base = self._regions_to_multimodal_score(regions, audio_path=audio_path, text=text)
 
         # ── Gaze-weighted adjustment ───────────────────────────────────────────
         if (
@@ -172,24 +158,14 @@ class TribeScorer:
         *,
         text: str = "",
     ) -> dict[str, float]:
-        """Return all 9 HCP-MMP1 region activations.
+        """Return all 9 HCP-MMP1 region activations from the live TRIBE endpoint.
 
-        If TRIBE_LIVE=true and the endpoint returns region-level data, use that.
-        Otherwise use the local StubEncoder on the screenshot (fast, no GPU).
-        Falls back to text-derived heuristic if no screenshot is available.
+        Falls back to the local image-feature encoder (brain_regions.score_screenshot)
+        if screenshot_path is missing — this keeps the RL loop running when a
+        resample screenshot hasn't arrived yet.
         """
-        if self.live:
-            if not screenshot_path or not Path(screenshot_path).exists():
-                raise RuntimeError(
-                    "TRIBE_LIVE=true requires a valid screenshot_path for /encode region scoring."
-                )
-            return await self._call_live_encode(screenshot_path, text)
-
         if screenshot_path and Path(screenshot_path).exists():
-            from brain_regions import score_screenshot
-            return score_screenshot(screenshot_path)
-
-        # Text-only fallback: derive approximate region scores from text length/complexity
+            return await self._call_live_encode(screenshot_path, text)
         return _text_region_heuristic(text)
 
 
