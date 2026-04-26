@@ -255,15 +255,44 @@ class GazePredictor:
 
     # ── Async entry point ──────────────────────────────────────────────────────
 
+    def _build_overlay_b64(self, screenshot_path: str) -> str:
+        """Generate saliency heatmap blended onto screenshot, return PNG base64."""
+        try:
+            import base64
+            import cv2
+
+            image = cv2.imread(screenshot_path)
+            if image is None:
+                return ""
+            sal, _, _ = self.predict_saliency(screenshot_path)
+            sal_resized = cv2.resize(sal, (image.shape[1], image.shape[0]))
+            mn, mx = sal_resized.min(), sal_resized.max()
+            if mx > mn:
+                sal_u8 = ((sal_resized - mn) / (mx - mn) * 255).astype(np.uint8)
+            else:
+                sal_u8 = np.zeros(sal_resized.shape, dtype=np.uint8)
+            heatmap = cv2.applyColorMap(sal_u8, cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(image, 0.55, heatmap, 0.45, 0)
+            ok, buf = cv2.imencode(".png", overlay)
+            if not ok:
+                return ""
+            return base64.b64encode(buf.tobytes()).decode()
+        except Exception:
+            return ""
+
     async def analyze(self, screenshot_path: str, top_k: int = 5) -> dict:
         """Run in executor so CPU-bound work doesn't block the event loop."""
         if not screenshot_path or not Path(screenshot_path).exists():
             return {"regions": [], "gaze_live": self.live}
 
         loop = asyncio.get_event_loop()
-        regions = await loop.run_in_executor(
-            None, self.get_salient_regions, screenshot_path, top_k
-        )
+
+        def _run():
+            regions = self.get_salient_regions(screenshot_path, top_k)
+            overlay_b64 = self._build_overlay_b64(screenshot_path)
+            return regions, overlay_b64
+
+        regions, overlay_b64 = await loop.run_in_executor(None, _run)
         return {
             "regions": [
                 {
@@ -275,6 +304,7 @@ class GazePredictor:
                 for r in regions
             ],
             "gaze_live": self.live,
+            "overlay_b64": overlay_b64,
         }
 
 

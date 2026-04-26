@@ -10,6 +10,7 @@ Each run is an "episode":
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import random
 import tempfile
@@ -325,11 +326,18 @@ class NeuralOptimizer:
             current_brain = baseline_brain.copy()
             baseline_ethics = evaluate_ethics(baseline_brain, intent)
 
+            _baseline_ss_b64 = ""
+            _bss_path = page.screenshot_path or ""
+            if _bss_path and Path(_bss_path).exists():
+                with open(_bss_path, "rb") as _fh:
+                    _baseline_ss_b64 = base64.b64encode(_fh.read()).decode()
+
             await self._emit(job, "progress", {
                 "status": "baseline",
                 "message": f"Baseline overall: {baseline_score['overall_score']:.4f}",
                 "score": baseline_score,
                 "iteration_count": 0, "max_iterations": max_iterations,
+                "annotated_screenshot_base64": _baseline_ss_b64,
             })
             await self._emit(job, "brain_regions", {
                 "iteration_count": 0,
@@ -844,6 +852,14 @@ class HtmlOptimizationLoop:
             gaze_data = await gaze_task
             gaze_regions = gaze_data["regions"]
 
+            _gaze_ss_b64 = ""
+            _gss_path = page.screenshot_path or ""
+            if _gss_path and Path(_gss_path).exists():
+                with open(_gss_path, "rb") as _fh:
+                    _gaze_ss_b64 = base64.b64encode(_fh.read()).decode()
+
+            _gaze_overlay_b64 = gaze_data.get("overlay_b64", "") or _gaze_ss_b64
+
             await self._emit(job, "gaze", {
                 "status": "gaze_complete",
                 "message": (
@@ -852,6 +868,8 @@ class HtmlOptimizationLoop:
                 ),
                 "gaze_regions": gaze_regions,
                 "gaze_live": gaze_data.get("gaze_live", False),
+                "annotated_screenshot_base64": _gaze_overlay_b64,
+                "gaze_overlay_base64": _gaze_overlay_b64,
             })
 
             # ── 3. Baseline ───────────────────────────────────────────────
@@ -871,11 +889,18 @@ class HtmlOptimizationLoop:
             accepted_edits: list[dict] = []
             iteration_screenshots: dict[int, str] = {}
 
+            _html_ss_b64 = ""
+            _hss_path = page.screenshot_path or ""
+            if _hss_path and Path(_hss_path).exists():
+                with open(_hss_path, "rb") as _fh:
+                    _html_ss_b64 = base64.b64encode(_fh.read()).decode()
+
             await self._emit(job, "progress", {
                 "status": "baseline",
                 "message": f"Baseline overall: {baseline_score['overall_score']:.4f}",
                 "score": baseline_score,
                 "iteration_count": 0, "max_iterations": max_iterations,
+                "annotated_screenshot_base64": _html_ss_b64,
             })
 
             # Emit baseline brain regions so BrainPanel shows data immediately

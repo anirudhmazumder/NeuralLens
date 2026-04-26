@@ -151,9 +151,10 @@ export default function AgentVisionPanel({
   const [imgDims, setImgDims] = useState({ w: 1280, h: 800 })
 
   // Derive all display data from the events array
-  const { annotatedScreenshot, plainScreenshot, gazeRegions, agentThought, memoryCount, terminalLines } = useMemo(() => {
-    let annotated = null
-    let plain = null
+  const { gazeHeatmap, iterScreenshot, plainScreenshot, gazeRegions, agentThought, memoryCount, terminalLines } = useMemo(() => {
+    let gazeHM = null      // saliency heatmap blend from gaze event
+    let iterSS = null      // latest annotated screenshot from iterations/baseline
+    let plain = null       // fallback URL from complete event
     let gaze = []
     let thought = null
     let memCount = 0
@@ -162,17 +163,21 @@ export default function AgentVisionPanel({
     for (const ev of events) {
       const { type, data } = ev
 
-      // Build terminal lines
       const newLines = buildLines(type, data, ev.ts)
       lines.push(...newLines)
 
       if (type === 'gaze') {
         gaze = data.gaze_regions || []
+        // Gaze event carries the saliency heatmap blend
+        if (data.annotated_screenshot_base64) {
+          gazeHM = `data:image/png;base64,${data.annotated_screenshot_base64}`
+        }
       }
 
       if (type === 'progress') {
+        // Baseline / iteration_complete carry the latest plain/annotated screenshot
         if (data.annotated_screenshot_base64) {
-          annotated = `data:image/jpeg;base64,${data.annotated_screenshot_base64}`
+          iterSS = `data:image/png;base64,${data.annotated_screenshot_base64}`
         }
         if (data.agent_thought) thought = data.agent_thought
         if (data.memory_count != null) memCount = data.memory_count
@@ -185,7 +190,8 @@ export default function AgentVisionPanel({
     }
 
     return {
-      annotatedScreenshot: annotated,
+      gazeHeatmap: gazeHM,
+      iterScreenshot: iterSS,
       plainScreenshot: plain,
       gazeRegions: gaze,
       agentThought: thought,
@@ -194,7 +200,9 @@ export default function AgentVisionPanel({
     }
   }, [events])
 
-  const imgSrc = annotatedScreenshot || plainScreenshot || null
+  // When heatmap toggle is on and we have a saliency overlay, show it.
+  // Otherwise show the latest iteration screenshot or the before-screenshot fallback.
+  const imgSrc = (showHeatmap && gazeHeatmap) ? gazeHeatmap : (iterScreenshot || plainScreenshot || null)
   const progress = maxIterations > 0 ? (currentIter / maxIterations) * 100 : 0
 
   return (
@@ -244,8 +252,8 @@ export default function AgentVisionPanel({
                     }
                   }}
                 />
-                {/* SVG scan path if we have gaze regions but are showing plain screenshot */}
-                {!annotatedScreenshot && gazeRegions.length > 0 && (
+                {/* SVG gaze overlay: ranked circles + scan path */}
+                {gazeRegions.length > 0 && (
                   <svg
                     className="absolute inset-0 w-full h-full pointer-events-none"
                     viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}

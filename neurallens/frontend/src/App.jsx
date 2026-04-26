@@ -62,6 +62,7 @@ export default function App() {
   const [gazeOverlayBase64, setGazeOverlayBase64] = useState('')
   const [analysisView, setAnalysisView] = useState('brain') // brain | deepgaze
   const [backendInfo, setBackendInfo] = useState(null)
+  const [optimizedHtml, setOptimizedHtml] = useState(null)  // final HTML string for file mode iframe
   const [pendingApproval, setPendingApproval] = useState(null)
 
   const esRef = useRef(null)
@@ -187,6 +188,7 @@ export default function App() {
       if (data.final_brain_regions) setBrainRegions(data.final_brain_regions)
       if (data.ethics_flags) setEthicsFlags(data.ethics_flags)
       setJobIdForPreview(data.job_id)
+      if (data.optimized_html) setOptimizedHtml(data.optimized_html)
       esRef.current?.close()
     }
 
@@ -258,6 +260,7 @@ export default function App() {
     setBrainRegions(null)
     setEthicsFlags([])
     setIntentReward(null)
+    setOptimizedHtml(null)
     setGazeRegions([])
     setGazeOverlayBase64('')
     setAnalysisView('brain')
@@ -520,19 +523,33 @@ export default function App() {
               <div className="text-xs text-red-400 truncate max-w-xs">{error}</div>
             )}
           </div>
-          {/* Full-height Agent Vision Panel */}
-          <div className="flex-1 min-h-0">
-            <AgentVisionPanel
-              events={events}
-              chartData={chartData}
-              status={status}
-              currentIter={currentIter}
-              maxIterations={maxIterations}
-              baselineScore={baselineScore}
-              finalScore={finalScore}
-              url={url}
-            />
-          </div>
+          {/* After file-mode job completes: swap to live before/after iframe comparison */}
+          {status === 'complete' && inputMode === 'file' && uploadedHtml && optimizedHtml ? (
+            <div className="flex-1 min-h-0 overflow-y-auto p-4">
+              <HtmlBeforeAfterPanel
+                originalHtml={uploadedHtml.html_content}
+                optimizedHtml={optimizedHtml}
+                filename={uploadedHtml.filename}
+                baselineScore={baselineScore}
+                finalScore={finalScore}
+                onDownload={downloadOptimizedHtml}
+              />
+            </div>
+          ) : (
+            /* Full-height Agent Vision Panel while running */
+            <div className="flex-1 min-h-0">
+              <AgentVisionPanel
+                events={events}
+                chartData={chartData}
+                status={status}
+                currentIter={currentIter}
+                maxIterations={maxIterations}
+                baselineScore={baselineScore}
+                finalScore={finalScore}
+                url={url}
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -821,22 +838,16 @@ export default function App() {
             />
           )}
 
-          {/* Download optimized HTML — only shown after an HTML file job completes */}
-          {status === 'complete' && inputMode === 'file' && htmlJobId && (
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex-shrink-0 flex items-center gap-4">
-              <div className="flex-1 min-w-0">
-                <div className="text-xs font-semibold text-gray-300">Optimized HTML ready</div>
-                <div className="text-[10px] text-gray-500 mt-0.5 truncate">
-                  {uploadedHtml?.filename ?? 'upload.html'} — design improvements applied
-                </div>
-              </div>
-              <button
-                onClick={downloadOptimizedHtml}
-                className="flex-shrink-0 flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white font-semibold py-2 px-4 rounded-lg text-sm transition cursor-pointer"
-              >
-                ⬇ Download
-              </button>
-            </div>
+          {/* HTML file before/after iframe comparison */}
+          {status === 'complete' && inputMode === 'file' && uploadedHtml && optimizedHtml && (
+            <HtmlBeforeAfterPanel
+              originalHtml={uploadedHtml.html_content}
+              optimizedHtml={optimizedHtml}
+              filename={uploadedHtml.filename}
+              baselineScore={baselineScore}
+              finalScore={finalScore}
+              onDownload={downloadOptimizedHtml}
+            />
           )}
 
           {/* Before / After page preview */}
@@ -883,6 +894,79 @@ export default function App() {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+
+function HtmlBeforeAfterPanel({ originalHtml, optimizedHtml, filename, baselineScore, finalScore, onDownload }) {
+  const [activePane, setActivePane] = useState('split') // 'split' | 'before' | 'after'
+
+  const improvement = baselineScore && finalScore
+    ? (((finalScore.overall_score - baselineScore.overall_score) / Math.max(baselineScore.overall_score, 1e-6)) * 100).toFixed(1)
+    : null
+
+  return (
+    <div className="flex flex-col gap-3 flex-shrink-0">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="text-xs font-semibold text-gray-300">Live HTML Comparison</span>
+          <span className="text-[10px] text-gray-600 truncate max-w-[180px]">{filename}</span>
+          {improvement !== null && (
+            <span className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+              parseFloat(improvement) >= 0 ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'
+            }`}>
+              {parseFloat(improvement) >= 0 ? '+' : ''}{improvement}% neural score
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex rounded-lg overflow-hidden border border-gray-700 text-[11px]">
+            {[['split','⬛ Split'],['before','📄 Original'],['after','✨ Optimized']].map(([v, label]) => (
+              <button key={v} onClick={() => setActivePane(v)}
+                className={`px-3 py-1.5 font-medium transition cursor-pointer ${
+                  activePane === v ? (v === 'after' ? 'bg-violet-600 text-white' : 'bg-gray-700 text-white') : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
+                }`}>{label}</button>
+            ))}
+          </div>
+          <button onClick={onDownload}
+            className="flex items-center gap-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold py-1.5 px-3 rounded-lg text-[11px] transition cursor-pointer">
+            ⬇ Download
+          </button>
+        </div>
+      </div>
+
+      {/* Iframe panes */}
+      <div className={`rounded-xl overflow-hidden border border-gray-700/50 bg-gray-950 ${activePane === 'split' ? 'flex gap-0' : ''}`} style={{ height: 540 }}>
+        {activePane === 'split' ? (
+          <>
+            <div className="flex-1 relative border-r border-gray-700/50">
+              <div className="absolute top-2 left-2 z-10 text-[10px] font-bold px-2 py-0.5 rounded bg-gray-800/90 text-gray-400 border border-gray-700">ORIGINAL</div>
+              <iframe srcDoc={originalHtml} className="w-full h-full border-0 bg-white" sandbox="allow-same-origin" title="Original HTML" />
+            </div>
+            <div className="flex-1 relative">
+              <div className="absolute top-2 left-2 z-10 text-[10px] font-bold px-2 py-0.5 rounded bg-violet-800/90 text-violet-200 border border-violet-700">NEURAL-OPTIMIZED</div>
+              <iframe srcDoc={optimizedHtml} className="w-full h-full border-0 bg-white" sandbox="allow-same-origin" title="Optimized HTML" />
+            </div>
+          </>
+        ) : activePane === 'before' ? (
+          <div className="relative w-full h-full">
+            <div className="absolute top-2 left-2 z-10 text-[10px] font-bold px-2 py-0.5 rounded bg-gray-800/90 text-gray-400 border border-gray-700">ORIGINAL</div>
+            <iframe srcDoc={originalHtml} className="w-full h-full border-0 bg-white" sandbox="allow-same-origin" title="Original HTML" />
+          </div>
+        ) : (
+          <div className="relative w-full h-full">
+            <div className="absolute top-2 left-2 z-10 text-[10px] font-bold px-2 py-0.5 rounded bg-violet-800/90 text-violet-200 border border-violet-700">NEURAL-OPTIMIZED</div>
+            <iframe srcDoc={optimizedHtml} className="w-full h-full border-0 bg-white" sandbox="allow-same-origin" title="Optimized HTML" />
+          </div>
+        )}
+      </div>
+
+      {activePane === 'split' && (
+        <p className="text-[11px] text-gray-600 text-center">
+          Original on the left · NeuralLens-optimized on the right · Both are live rendered HTML
+        </p>
+      )}
+    </div>
+  )
+}
 
 function ApprovalBar({ pending, onDecision }) {
   const [expanded, setExpanded] = useState(true)

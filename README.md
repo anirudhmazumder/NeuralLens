@@ -1,125 +1,134 @@
-# NeuralLens — NeuroUI Optimizer
+# NeuralLens
 
-AI-powered UI design optimization using brain activation prediction.
+NeuralLens is an AI system for optimizing webpages using predicted neural engagement, gaze saliency, and iterative agent-driven edits.
 
-Pipeline: UI screenshot → predicted fMRI activation (TRIBE v2) → ROI scoring (HCP atlas) → reward signal → Claude agent suggests one concrete edit → repeat 5–10 times.
+It combines:
+- a web app for live URL + HTML upload optimization,
+- a research/CLI package for deeper experimentation,
+- and a deployed multi-agent interface in **FetchAI Agenteverse** that can call into the NeuralLens optimization algorithm.
 
-## Status
+## What We Built
 
-Hackathon scaffolding. The pipeline runs end-to-end today with an **atlas-backed demo encoder** (real HCP-MMP1 masks plus synthetic voxel activations), so you can exercise ROI aggregation and reward dynamics without a GPU. Full TRIBE v2 inference remains behind the `neuro` extra (see `src/neurolens/tribe.py`).
+NeuralLens runs an optimization loop:
 
-> **TRIBE encoder status:** `--encoder tribe` is a placeholder and is not implemented yet.
-> Use `--encoder atlas` (local demo) or `--encoder remote` (your hosted TRIBE endpoint).
+1. Capture page state (screenshot + extracted text)
+2. Score predicted neural response with a TRIBE-style encoder
+3. Run gaze analysis to locate highest-attention regions
+4. Let an LLM agent propose one focused edit
+5. Re-score and accept only improvements
+6. Repeat for N iterations and surface transparent metrics/events
 
-## Install
+For hackathon use, this enables teams to improve web engagement before shipping or spending on traffic.
 
-```bash
-pip install -e .             # core: agent + reward + stub encoder
-pip install -e '.[neuro]'    # adds torch, transformers, nilearn for real TRIBE v2
-pip install -e '.[dev]'      # tests
+## Multi-Agent Deployment (FetchAI Agenteverse)
+
+We have deployed our multi-agent orchestration layer into **FetchAI Agenteverse**.  
+That deployment can interface with NeuralLens by:
+
+- receiving optimization tasks from external agent workflows,
+- invoking NeuralLens optimization jobs through API-compatible task calls,
+- and returning structured outputs (scores, accepted edits, and final artifacts) back into agent pipelines.
+
+This makes NeuralLens usable both as a standalone app and as an optimization service in autonomous agent ecosystems.
+
+## Repository Structure
+
+### `neurallens/` (Web App: FastAPI + React)
+- URL optimization flow with live SSE streaming
+- HTML upload flow with direct HTML/CSS optimization and downloadable output
+- Gaze analysis + heatmap overlays
+- Agent vision/debug panels, score charts, memory/pattern views
+
+### `src/neurolens/` (Python Package + CLI)
+- Brain-region scoring and reward logic
+- Ethics checks and transparency reporting
+- Iterative optimization loop for research workflows
+- CLI entry points for local experimentation
+
+## Core Features
+
+- Neural score-guided optimization (TRIBE endpoint + fallback encoder)
+- Gaze-aware prioritization (DeepGaze/live or heuristic fallback)
+- Iterative agent edits with acceptance/rejection by reward delta
+- HTML upload mode that returns optimized HTML code
+- Real-time progress streaming via SSE
+- Cross-session memory and pattern learning
+
+## High-Level Architecture
+
+```text
+URL or HTML input
+        |
+        v
+Playwright render/extract
+        |
+        +--> TRIBE scorer ---------+
+        |                          |
+        +--> Gaze predictor ------>+--> Optimization agent --> apply edit --> re-score loop
+                                   |
+                                   +--> SSE events + summary artifacts
 ```
 
-## Run a demo loop
+## Quick Start (Web App)
 
+### Backend
 ```bash
-export ANTHROPIC_API_KEY=your_anthropic_api_key_here
-neurolens fetch-atlas
-neurolens optimize path/to/screenshot.png --intent engage --iters 5
+cd neurallens/backend
+pip install -r requirements.txt
+playwright install chromium
+uvicorn main:app --reload --port 8080
 ```
 
-`neurolens optimize` now defaults to `--encoder atlas`. If the atlas file is missing, it falls back to a synthetic mini-atlas and prints a notice.
-
-Outputs land in `runs/<timestamp>/`: per-iteration screenshots, region score JSON, and a plain-language transparency report.
-
-## GitHub + Local Demo Safety
-
-- Keep secrets in local env files only (`.env`), never in committed files.
-- `neurallens/.env.example` is a template; commit it, but do not put real keys in it.
-- Use generic endpoint placeholders in docs (for example `https://<your-host>/encode`).
-- Local artifacts like `*.db`, `runs/`, and `node_modules/` should stay gitignored.
-
-### Use a remote TRIBE server (e.g. Colab + ngrok)
-
-If you already host TRIBE inference elsewhere, call it with the `remote` encoder:
-
+### Frontend
 ```bash
-neurolens optimize path/to/screenshot.png \
-  --encoder remote \
-  --remote-endpoint "https://<your-host>/encode" \
-  --remote-timeout 45
+cd neurallens/frontend
+npm install
+npm run dev
 ```
 
-Optional auth:
+Open the local Vite URL shown in terminal (typically `http://localhost:5173`).
 
-```bash
-neurolens optimize path/to/screenshot.png \
-  --encoder remote \
-  --remote-endpoint "https://<your-host>/encode" \
-  --remote-token "<bearer-token>"
-```
+## Environment
 
-If your server expects **raw PNG bytes** in the POST body (Flask `request.data` style), set:
+Use `neurallens/.env.example` as the template.
 
-```bash
---remote-request-mode raw
-```
+Common variables:
+- `TRIBE_ENDPOINT` - live scoring endpoint
+- `TRIBE_TIMEOUT_SECONDS` - live call timeout (configurable)
+- `OPENAI_LIVE`, `OPENAI_API_KEY`, `OPENAI_MODEL` - agent behavior
+- `GAZE_LIVE`, `CENTERBIAS_PATH`, `GAZE_DEVICE` - gaze mode and model config
 
-Default `auto` first tries JSON (`image_base64`) and falls back to raw PNG when the server returns a 400 indicating raw bytes are required.
+## API Highlights
 
-Expected response JSON is either:
+- `POST /optimize` - start URL optimization
+- `GET /job/{id}/stream` - live SSE event stream
+- `GET /job/{id}/result` - final result payload
+- `POST /upload-html` - upload HTML and get baseline analysis
+- `POST /optimize-html` - start HTML optimization job
+- `GET /html-job/{id}/download` - download optimized HTML output
 
-- `{"scores": {"FFA": ..., "V4": ..., ...}}`, or
-- `{"region_scores": {"FFA": ..., "V4": ..., ...}, "vertices": {"lh": [...], "rh": [...]}, "meta": {...}}`, or
-- direct region map `{"FFA": ..., "V4": ..., ...}`.
+## Technical Notes
 
-Or voxel output:
+- TRIBE scoring falls back to local encoder if remote endpoint is unavailable/slow.
+- DeepGaze weights are cached locally to avoid repeated model downloads across restarts.
+- All optimization steps are observable through streamed events and frontend telemetry.
 
-- `{"voxels": [...]}` (1D flattened atlas grid) or `{"voxels": [[[...]]]}` (3D grid)
-- optional subcortical passthrough values: `Hippocampus`, `Amygdala`, `NAcc`
+## Ethics + Guardrails
 
-Use `--remote-response-mode voxels` to force voxel aggregation (default `auto` prefers explicit region scores).
+NeuralLens is built for engagement quality, not manipulative dark patterns:
+- intent-aware optimization
+- penalty-aware scoring and constraints
+- transparent action history and score deltas
 
-Required keys: `FFA`, `V4`, `MT+`, `Hippocampus`, `PFC`, `ACC`, `Amygdala`, `Insula`, `NAcc`.
+## Current Status
 
-If remote output is cortical-only (`FFA`, `V4`, `MT+`, `PFC`, `ACC`, `Insula`), NeuralLens will estimate
-`Hippocampus`, `Amygdala`, and `NAcc` locally from image/cortical cues (instead of fixed constants).
+The platform is fully demoable end-to-end:
+- live URL optimization,
+- uploaded HTML optimization with downloadable output,
+- and multi-agent integration via FetchAI Agenteverse.
 
-Use `--remote-subcortical-mode estimate` to always compute those three locally even if API provides placeholder values.
+## Submission-Oriented Project Rundown
 
-## Architecture
+For a fuller hackathon narrative, see:
 
-| Component | Module | Notes |
-|-----------|--------|-------|
-| Brain encoder | `tribe.py` | Atlas-backed demo encoder by default; TRIBE v2 wrapper in progress |
-| ROI aggregation | `rois.py` | Voxels → named regions via HCP-MMP1 masks |
-| Reward | `reward.py` | Intent-aware targets + penalties + Yerkes-Dodson ceiling |
-| Ethics | `ethics.py` | Dark pattern detector, valence check, intent gating |
-| Agent | `agent.py` | Claude (Opus 4.7) suggests one edit per iteration |
-| Edits | `edit.py` | PIL programmatic image transforms |
-| Transparency | `transparency.py` | Per-iteration plain-language report |
-| Loop | `loop.py` | End-to-end optimization driver |
-| CLI | `cli.py` | `neurolens optimize ...` |
-
-## Brain regions targeted
-
-Engagement: FFA, V4, MT+, Hippocampus
-Trust: PFC (DLPFC)
-Penalty: ACC, Amygdala, Insula
-Dual: Nucleus Accumbens (target only when intent=gamification)
-Language channel: Broca's / Wernicke's (text encoder, optional)
-
-See `docs/regions.md` (coming) for activation drivers and agent prompts per region.
-
-## Ethics
-
-Built in, not bolted on:
-
-- **Intent declaration** required at run start (`engage` / `trust` / `convert` / `accessibility` / `gamification`)
-- **Dark pattern detector** — flags edits that push amygdala > 0.6 or NAcc > 0.7 without matching intent
-- **Yerkes-Dodson ceiling** — penalty when any region exceeds 0.85 (avoid runaway stimulation)
-- **Valence check** — never optimize toward high-arousal-negative states
-- **Transparency report** — every run dumps which regions changed, by how much, what edit drove it, and any ethical flags raised
-
-## What's honest
-
-TRIBE v2 predicts population-average responses, not individual brains. fMRI is an indirect (blood-flow) proxy. Applying region-level neuroscience to UI is a novel inference layer — the regions themselves are well-replicated; the UI mapping is informed hypothesis. The amygdala/insula UI inferences are the most extrapolated.
+- `neurallens/HACKATHON_SUBMISSION_DRAFT.md`
