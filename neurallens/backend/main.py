@@ -26,6 +26,13 @@ app = FastAPI(title="NeuralLens API", version="0.3.0")
 # Cache screenshot paths keyed by URL so /gaze-analysis avoids re-scraping
 _screenshot_cache: dict[str, str] = {}
 
+
+def _cached_screenshot(url: str) -> str:
+    p = _screenshot_cache.get(url, "")
+    if p and Path(p).exists():
+        return p
+    return ""
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -182,7 +189,12 @@ async def parse_page(req: ParsePageRequest):
     _screenshot_cache[req.url] = page.screenshot_path  # cache for gaze analysis
 
     components = _parse_into_components(page.text)
-    page_score = await scorer.score(page.video_path, page.text, page.audio_path)
+    page_score = await scorer.score(
+        page.video_path,
+        page.text,
+        page.audio_path,
+        screenshot_path=page.screenshot_path,
+    )
 
     screenshot_b64 = ""
     if page.screenshot_path and Path(page.screenshot_path).exists():
@@ -201,11 +213,17 @@ async def parse_page(req: ParsePageRequest):
 async def score_layout(req: ScoreLayoutRequest):
     scorer = TribeScorer()
     full_text = "\n\n".join(c.get("content", "") for c in req.components)
-    total_score = await scorer.score("", full_text, "")
+    shot = _cached_screenshot(req.url)
+    total_score = await scorer.score("", full_text, "", screenshot_path=shot or None)
 
     per_component = []
     for comp in req.components:
-        comp_score = await scorer.score("", comp.get("content", ""), "")
+        comp_score = await scorer.score(
+            "",
+            comp.get("content", ""),
+            "",
+            screenshot_path=shot or None,
+        )
         per_component.append({
             "id": comp.get("id"),
             "type": comp.get("type"),
@@ -251,7 +269,8 @@ async def apply_edit(req: ApplyEditRequest):
     if original and original in req.current_text:
         new_text = req.current_text.replace(original, replacement, 1)
 
-    new_score = await scorer.score("", new_text, "")
+    shot = _cached_screenshot(req.url)
+    new_score = await scorer.score("", new_text, "", screenshot_path=shot or None)
     score_delta = new_score["overall_score"] - req.current_score.get("overall_score", 0)
     accepted = score_delta > 0
 

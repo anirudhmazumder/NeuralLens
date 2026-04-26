@@ -17,6 +17,7 @@ Brain region scoring:
 """
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,99 @@ from stubs import fake_tribe_score
 class TribeScorer:
     def __init__(self) -> None:
         self.live = os.getenv("TRIBE_LIVE", "false").lower() == "true"
-        self.endpoint = os.getenv("TRIBE_ENDPOINT", "http://localhost:9090")
+        self.endpoint = os.getenv("TRIBE_ENDPOINT", "http://localhost:9090/encode")
+
+    def _encode_url(self) -> str:
+        ep = self.endpoint.rstrip("/")
+        if ep.endswith("/encode"):
+            return ep
+        return f"{ep}/encode"
+
+    @staticmethod
+    def _extract_regions(payload: dict) -> dict[str, float]:
+        # Accept a few schema variants from live TRIBE services.
+        if isinstance(payload.get("region_scores"), dict):
+            base = payload["region_scores"]
+        elif isinstance(payload.get("scores"), dict):
+            base = payload["scores"]
+        elif isinstance(payload.get("regions"), dict):
+            base = payload["regions"]
+        else:
+            base = payload
+
+        regions: dict[str, float] = {}
+        for key in ("FFA", "V4", "MT+", "PFC", "ACC", "Insula"):
+            if key in base:
+                regions[key] = float(base[key])
+
+        sub = payload.get("subcortical_estimates")
+        sub_vals = sub.get("values") if isinstance(sub, dict) and isinstance(sub.get("values"), dict) else {}
+        for key in ("Hippocampus", "Amygdala", "NAcc"):
+            if key in base:
+                regions[key] = float(base[key])
+            elif key in sub_vals:
+                regions[key] = float(sub_vals[key])
+
+        required = {"FFA", "V4", "MT+", "Hippocampus", "PFC", "ACC", "Amygdala", "Insula", "NAcc"}
+        missing = sorted(required - set(regions.keys()))
+        if missing:
+            raise RuntimeError(
+                "TRIBE live response missing required regions: "
+                + ", ".join(missing)
+            )
+        return regions
+
+    async def _call_live_encode(self, screenshot_path: str, text: str) -> dict[str, float]:
+        import httpx  # type: ignore
+
+        url = self._encode_url()
+        with open(screenshot_path, "rb") as fh:
+            png = fh.read()
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # First try raw PNG body (Flask request.data style).
+            r = await client.post(url, content=png, headers={"Content-Type": "image/png"})
+            if r.status_code >= 400:
+                # Fallback to JSON base64 (common FastAPI shape).
+                payload = {"image_base64": base64.b64encode(png).decode(), "text": text}
+                r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        return self._extract_regions(data)
+
+    @staticmethod
+    def _regions_to_multimodal_score(regions: dict[str, float], *, audio_path: Optional[str], text: str) -> dict:
+        # Keep output contract expected by optimizer/frontend.
+        ffa = regions["FFA"]
+        v4 = regions["V4"]
+        mt = regions["MT+"]
+        hip = regions["Hippocampus"]
+        pfc = regions["PFC"]
+        acc = regions["ACC"]
+        amyg = regions["Amygdala"]
+        ins = regions["Insula"]
+        nacc = regions["NAcc"]
+
+        visual_roi = max(0.0, min(1.0, 0.45 * v4 + 0.35 * ffa + 0.20 * mt))
+        attention_roi = max(0.0, min(1.0, 0.30 * ffa + 0.25 * v4 + 0.15 * mt + 0.20 * nacc + 0.10 * pfc))
+        language_roi = max(0.0, min(1.0, 0.55 * pfc + 0.30 * hip + 0.15 * ffa))
+        penalty = 0.55 * amyg + 0.30 * ins + 0.15 * acc
+        overall = max(0.0, min(1.0, 0.36 * attention_roi + 0.34 * language_roi + 0.30 * visual_roi - 0.35 * penalty))
+        # Use lightweight text/audio modulation, but never stubbed random values.
+        text_bonus = min(0.05, max(0.0, len(text.split()) / 2000.0))
+        audio_score = 0.55 if audio_path else 0.30
+        overall = max(0.0, min(1.0, overall + text_bonus))
+
+        return {
+            "overall_score": round(overall, 4),
+            "visual_score": round(visual_roi, 4),
+            "text_score": round(language_roi, 4),
+            "audio_score": round(audio_score, 4),
+            "language_roi": round(language_roi, 4),
+            "attention_roi": round(attention_roi, 4),
+            "visual_roi": round(visual_roi, 4),
+            "atlas_regions": {k: round(float(v), 4) for k, v in regions.items()},
+        }
 
     async def score(
         self,
@@ -41,14 +134,12 @@ class TribeScorer:
         if not self.live:
             base = await fake_tribe_score(video_path, text, audio_path)
         else:
-            import httpx  # type: ignore
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    f"{self.endpoint}/score",
-                    json={"video_path": video_path, "text": text, "audio_path": audio_path},
+            if not screenshot_path or not Path(screenshot_path).exists():
+                raise RuntimeError(
+                    "TRIBE_LIVE=true requires a valid screenshot_path for /encode scoring."
                 )
-                resp.raise_for_status()
-                base = resp.json()
+            regions = await self._call_live_encode(screenshot_path, text)
+            base = self._regions_to_multimodal_score(regions, audio_path=audio_path, text=text)
 
         # ── Gaze-weighted adjustment ───────────────────────────────────────────
         if (
@@ -78,23 +169,12 @@ class TribeScorer:
         Otherwise use the local StubEncoder on the screenshot (fast, no GPU).
         Falls back to text-derived heuristic if no screenshot is available.
         """
-        if self.live and screenshot_path and Path(screenshot_path).exists():
-            try:
-                import httpx  # type: ignore
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    with open(screenshot_path, "rb") as fh:
-                        import base64 as _b64
-                        img_b64 = _b64.b64encode(fh.read()).decode()
-                    resp = await client.post(
-                        f"{self.endpoint}/brain-regions",
-                        json={"image_base64": img_b64, "text": text},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if "regions" in data:
-                            return data["regions"]
-            except Exception:
-                pass  # fall through to local stub
+        if self.live:
+            if not screenshot_path or not Path(screenshot_path).exists():
+                raise RuntimeError(
+                    "TRIBE_LIVE=true requires a valid screenshot_path for /encode region scoring."
+                )
+            return await self._call_live_encode(screenshot_path, text)
 
         if screenshot_path and Path(screenshot_path).exists():
             from brain_regions import score_screenshot

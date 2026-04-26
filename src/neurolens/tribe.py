@@ -22,8 +22,13 @@ learned voxel predictors.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import math
+from io import BytesIO
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -216,6 +221,260 @@ class TribeV2Encoder:
 
 
 @dataclass
+class RemoteTribeEncoder:
+    """Call a remote TRIBE inference endpoint that returns region scores."""
+
+    endpoint: str
+    token: str | None = None
+    timeout_s: float = 30.0
+    image_field: str = "image_base64"
+    request_mode: str = "auto"  # auto | json | raw
+    response_mode: str = "auto"  # auto | scores | voxels
+    masks: object | None = None
+    voxel_shape: tuple[int, int, int] | None = None
+    normalize_voxels: bool = True
+    subcortical_mode: str = "auto"  # auto | api | estimate
+
+    def __post_init__(self) -> None:
+        self.endpoint = self.endpoint.strip()
+        if not self.endpoint:
+            raise ValueError("remote endpoint cannot be empty")
+        if not (self.endpoint.startswith("http://") or self.endpoint.startswith("https://")):
+            raise ValueError(f"remote endpoint must be http(s), got: {self.endpoint!r}")
+        if self.request_mode not in {"auto", "json", "raw"}:
+            raise ValueError(f"remote request_mode must be one of auto/json/raw, got {self.request_mode!r}")
+        if self.response_mode not in {"auto", "scores", "voxels"}:
+            raise ValueError(f"remote response_mode must be one of auto/scores/voxels, got {self.response_mode!r}")
+        if self.subcortical_mode not in {"auto", "api", "estimate"}:
+            raise ValueError(
+                f"remote subcortical_mode must be one of auto/api/estimate, got {self.subcortical_mode!r}"
+            )
+
+    def _headers(self, content_type: str) -> dict[str, str]:
+        headers = {"Content-Type": content_type, "Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _post(self, body: bytes, content_type: str) -> bytes:
+        req = Request(
+            self.endpoint,
+            data=body,
+            headers=self._headers(content_type),
+            method="POST",
+        )
+        with urlopen(req, timeout=self.timeout_s) as resp:
+            return resp.read()
+
+    @staticmethod
+    def _lookup_num(d: dict[str, object], key: str) -> float | None:
+        v = d.get(key)
+        if v is None:
+            v = d.get(key.lower())
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _fill_subcortical(
+        self,
+        out: dict[str, float],
+        image: Image.Image,
+        *,
+        preferred: dict[str, object] | None = None,
+        fallback: dict[str, object] | None = None,
+    ) -> dict[str, float]:
+        """
+        Ensure Hippocampus/Amygdala/NAcc exist.
+
+        Priority:
+        1) explicit values from response (preferred, then fallback dicts)
+        2) local image-driven estimates (no fixed constants)
+        """
+        preferred = preferred or {}
+        fallback = fallback or {}
+        pref_sub = preferred.get("subcortical_estimates")
+        pref_vals = pref_sub.get("values") if isinstance(pref_sub, dict) else {}
+        fb_sub = fallback.get("subcortical_estimates")
+        fb_vals = fb_sub.get("values") if isinstance(fb_sub, dict) else {}
+
+        use_api = self.subcortical_mode in {"auto", "api"}
+        use_est = self.subcortical_mode in {"auto", "estimate"}
+
+        hip = None
+        if use_api:
+            hip = self._lookup_num(preferred, "Hippocampus")
+            if hip is None and isinstance(pref_vals, dict):
+                hip = self._lookup_num(pref_vals, "Hippocampus")
+            if hip is None:
+                hip = self._lookup_num(fallback, "Hippocampus")
+            if hip is None and isinstance(fb_vals, dict):
+                hip = self._lookup_num(fb_vals, "Hippocampus")
+        if hip is None and use_est:
+            hip = _novelty_hash(image)
+        if hip is None:
+            hip = 0.5
+
+        amyg = None
+        if use_api:
+            amyg = self._lookup_num(preferred, "Amygdala")
+            if amyg is None and isinstance(pref_vals, dict):
+                amyg = self._lookup_num(pref_vals, "Amygdala")
+            if amyg is None:
+                amyg = self._lookup_num(fallback, "Amygdala")
+            if amyg is None and isinstance(fb_vals, dict):
+                amyg = self._lookup_num(fb_vals, "Amygdala")
+        if amyg is None and use_est:
+            red = _red_dominance(image)
+            ins = float(out.get("Insula", _sigmoid(_palette_clash(image), center=0.4, k=8.0)))
+            acc = float(out.get("ACC", 0.5))
+            amyg = _sigmoid(0.55 * red + 0.30 * ins + 0.15 * acc, center=0.48, k=7.5)
+        if amyg is None:
+            amyg = 0.3
+
+        nacc = None
+        if use_api:
+            nacc = self._lookup_num(preferred, "NAcc")
+            if nacc is None and isinstance(pref_vals, dict):
+                nacc = self._lookup_num(pref_vals, "NAcc")
+            if nacc is None:
+                nacc = self._lookup_num(fallback, "NAcc")
+            if nacc is None and isinstance(fb_vals, dict):
+                nacc = self._lookup_num(fb_vals, "NAcc")
+        if nacc is None and use_est:
+            nacc = _sigmoid(_saturation(image) * _luma_contrast(image), center=0.35, k=8.0)
+        if nacc is None:
+            nacc = 0.4
+
+        out["Hippocampus"] = float(max(0.0, min(1.0, hip)))
+        out["Amygdala"] = float(max(0.0, min(1.0, amyg)))
+        out["NAcc"] = float(max(0.0, min(1.0, nacc)))
+        return out
+
+    def encode(self, image: Image.Image) -> dict[str, float]:
+        import numpy as np
+
+        buf = BytesIO()
+        image.convert("RGB").save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        payload = {
+            self.image_field: base64.b64encode(png_bytes).decode("ascii"),
+            "image_format": "PNG",
+        }
+        json_body = json.dumps(payload).encode("utf-8")
+        raw: bytes
+        try:
+            if self.request_mode == "raw":
+                raw = self._post(png_bytes, "image/png")
+            elif self.request_mode == "json":
+                raw = self._post(json_body, "application/json")
+            else:
+                try:
+                    raw = self._post(json_body, "application/json")
+                except HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    # Compatibility with Flask endpoints that expect raw PNG in request body.
+                    if e.code == 400 and ("raw PNG bytes" in detail or "request body" in detail):
+                        raw = self._post(png_bytes, "image/png")
+                    else:
+                        raise
+        except HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            msg = f"remote TRIBE HTTP {e.code}"
+            if detail:
+                msg += f": {detail}"
+            raise RuntimeError(msg) from e
+        except URLError as e:
+            raise RuntimeError(f"remote TRIBE request failed: {e}") from e
+
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError("remote TRIBE returned non-JSON response") from e
+
+        if not isinstance(data, dict):
+            raise RuntimeError("remote TRIBE response must be a JSON object")
+
+        def _try_scores(d: dict) -> dict[str, float] | None:
+            required_cortical = {"FFA", "V4", "MT+", "PFC", "ACC", "Insula"}
+            if isinstance(d.get("scores"), dict):
+                sraw = d["scores"]
+            elif isinstance(d.get("region_scores"), dict):
+                sraw = d["region_scores"]
+            else:
+                sraw = d
+            required = set(all_names())
+            if required.issubset(set(sraw.keys())):
+                out = {k: float(sraw[k]) for k in all_names()}
+                return self._fill_subcortical(out, image, preferred=sraw, fallback=d)
+            # Accept cortical-only responses and estimate missing subcortical values locally.
+            if required_cortical.issubset(set(sraw.keys())):
+                out = {k: float(sraw[k]) for k in required_cortical}
+                return self._fill_subcortical(out, image, preferred=sraw, fallback=d)
+            return None
+
+        def _try_voxels(d: dict) -> dict[str, float] | None:
+            if self.masks is None:
+                raise RuntimeError(
+                    "remote response contains voxels but no atlas masks were provided; "
+                    "pass masks=... when creating RemoteTribeEncoder"
+                )
+            vox = d.get("voxels")
+            if vox is None:
+                return None
+            arr = np.asarray(vox, dtype=np.float32)
+            if arr.ndim == 1:
+                pass
+            elif arr.ndim == 3:
+                arr = arr.ravel()
+            else:
+                raise RuntimeError(f"remote voxels must be 1D or 3D, got shape {arr.shape}")
+            if self.voxel_shape is not None and tuple(np.asarray(vox).shape) == self.voxel_shape:
+                arr = np.asarray(vox, dtype=np.float32).ravel()
+            from .rois import aggregate
+
+            cortical_scores = aggregate(arr, self.masks, normalize=self.normalize_voxels)
+            return self._fill_subcortical(dict(cortical_scores), image, fallback=d)
+
+        if self.response_mode == "scores":
+            scores = _try_scores(data)
+            if scores is None:
+                raise RuntimeError("remote response_mode=scores but response does not contain all region scores")
+            return scores
+        if self.response_mode == "voxels":
+            scores = _try_voxels(data)
+            if scores is None:
+                raise RuntimeError("remote response_mode=voxels but response has no 'voxels' field")
+            return scores
+
+        # auto: prefer explicit region scores; else aggregate voxels.
+        scores = _try_scores(data)
+        if scores is not None:
+            return scores
+        scores = _try_voxels(data)
+        if scores is not None:
+            return scores
+
+        required = set(all_names())
+        missing = sorted(required - set(data.keys()))
+        raise RuntimeError(
+            "remote TRIBE response did not include full region scores "
+            "and had no usable voxels field; missing regions: "
+            f"{missing}"
+        )
+
+
+@dataclass
 class AtlasStubEncoder:
     """Synthetic-voxels-through-real-atlas encoder."""
 
@@ -279,6 +538,22 @@ def load_encoder(name: str = "stub", **kwargs) -> Encoder:
         return AtlasStubEncoder(atlas=atlas, masks=masks)
     if name == "tribe":
         return TribeV2Encoder()
+    if name == "remote":
+        endpoint = kwargs.get("endpoint")
+        if not endpoint:
+            raise ValueError("remote encoder needs endpoint= kwargs")
+        return RemoteTribeEncoder(
+            endpoint=endpoint,
+            token=kwargs.get("token"),
+            timeout_s=float(kwargs.get("timeout_s", 30.0)),
+            image_field=str(kwargs.get("image_field", "image_base64")),
+            request_mode=str(kwargs.get("request_mode", "auto")),
+            response_mode=str(kwargs.get("response_mode", "auto")),
+            masks=kwargs.get("masks"),
+            voxel_shape=kwargs.get("voxel_shape"),
+            normalize_voxels=bool(kwargs.get("normalize_voxels", True)),
+            subcortical_mode=str(kwargs.get("subcortical_mode", "auto")),
+        )
     raise ValueError(f"unknown encoder: {name!r}")
 
 

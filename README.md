@@ -28,6 +28,54 @@ neurolens optimize path/to/screenshot.png --intent engage --iters 5
 
 Outputs land in `runs/<timestamp>/`: per-iteration screenshots, region score JSON, and a plain-language transparency report.
 
+### Use a remote TRIBE server (e.g. Colab + ngrok)
+
+If you already host TRIBE inference elsewhere, call it with the `remote` encoder:
+
+```bash
+neurolens optimize path/to/screenshot.png \
+  --encoder remote \
+  --remote-endpoint "https://deluge-glucose-rework.ngrok-free.dev/encode" \
+  --remote-timeout 45
+```
+
+Optional auth:
+
+```bash
+neurolens optimize path/to/screenshot.png \
+  --encoder remote \
+  --remote-endpoint "https://<your-host>/encode" \
+  --remote-token "<bearer-token>"
+```
+
+If your server expects **raw PNG bytes** in the POST body (Flask `request.data` style), set:
+
+```bash
+--remote-request-mode raw
+```
+
+Default `auto` first tries JSON (`image_base64`) and falls back to raw PNG when the server returns a 400 indicating raw bytes are required.
+
+Expected response JSON is either:
+
+- `{"scores": {"FFA": ..., "V4": ..., ...}}`, or
+- `{"region_scores": {"FFA": ..., "V4": ..., ...}, "vertices": {"lh": [...], "rh": [...]}, "meta": {...}}`, or
+- direct region map `{"FFA": ..., "V4": ..., ...}`.
+
+Or voxel output:
+
+- `{"voxels": [...]}` (1D flattened atlas grid) or `{"voxels": [[[...]]]}` (3D grid)
+- optional subcortical passthrough values: `Hippocampus`, `Amygdala`, `NAcc`
+
+Use `--remote-response-mode voxels` to force voxel aggregation (default `auto` prefers explicit region scores).
+
+Required keys: `FFA`, `V4`, `MT+`, `Hippocampus`, `PFC`, `ACC`, `Amygdala`, `Insula`, `NAcc`.
+
+If remote output is cortical-only (`FFA`, `V4`, `MT+`, `PFC`, `ACC`, `Insula`), NeuralLens will estimate
+`Hippocampus`, `Amygdala`, and `NAcc` locally from image/cortical cues (instead of fixed constants).
+
+Use `--remote-subcortical-mode estimate` to always compute those three locally even if API provides placeholder values.
+
 ## Architecture
 
 | Component | Module | Notes |

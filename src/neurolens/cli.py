@@ -33,10 +33,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     opt.add_argument(
         "--encoder",
-        choices=["stub", "atlas", "tribe"],
+        choices=["stub", "atlas", "tribe", "remote"],
         default="atlas",
         help="'stub' = image-feature only, 'atlas' = synthetic voxels through real "
-        "HCP-MMP1, 'tribe' = real TRIBE v2 (TODO).",
+        "HCP-MMP1, 'tribe' = real TRIBE v2 (TODO), 'remote' = call external TRIBE endpoint.",
     )
     opt.add_argument(
         "--atlas-path",
@@ -49,6 +49,42 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Optional Glasser labels TSV (index<TAB>L_<name>_ROI ...).",
+    )
+    opt.add_argument(
+        "--remote-endpoint",
+        type=str,
+        default=None,
+        help="For --encoder remote: HTTP(S) endpoint that accepts POST image JSON and returns region scores.",
+    )
+    opt.add_argument(
+        "--remote-token",
+        type=str,
+        default=None,
+        help="Optional bearer token for --encoder remote.",
+    )
+    opt.add_argument(
+        "--remote-timeout",
+        type=float,
+        default=30.0,
+        help="Timeout in seconds for --encoder remote.",
+    )
+    opt.add_argument(
+        "--remote-request-mode",
+        choices=["auto", "json", "raw"],
+        default="auto",
+        help="Remote body format: auto (try JSON then raw PNG), json (base64 JSON), or raw (binary PNG body).",
+    )
+    opt.add_argument(
+        "--remote-response-mode",
+        choices=["auto", "scores", "voxels"],
+        default="auto",
+        help="Remote response format: auto (prefer scores, else voxels), scores (region dict), or voxels (aggregate with atlas masks).",
+    )
+    opt.add_argument(
+        "--remote-subcortical-mode",
+        choices=["auto", "api", "estimate"],
+        default="auto",
+        help="How to set Hippocampus/Amygdala/NAcc for remote runs: auto (use API if present else estimate), api (trust API), estimate (always local estimates).",
     )
 
     fa = sub.add_parser("fetch-atlas", help="Download and cache the HCP-MMP1 atlas.")
@@ -156,7 +192,7 @@ def _demo_atlas(synthetic: bool, atlas_path: Path | None, labels_tsv: Path | Non
 def _optimize(args) -> int:
     from .agent import ClaudeAgent, MockAgent
     from .loop import LoopConfig, run
-    from .tribe import StubEncoder
+    from .tribe import StubEncoder, load_encoder
 
     if not args.image.exists():
         print(f"image not found: {args.image}", file=sys.stderr)
@@ -177,9 +213,38 @@ def _optimize(args) -> int:
         masks = RegionMasks.build(atlas)
         encoder = AtlasStubEncoder(atlas=atlas, masks=masks)
     else:
-        from .tribe import TribeV2Encoder
+        if args.encoder == "tribe":
+            encoder = load_encoder("tribe")
+        elif args.encoder == "remote":
+            if not args.remote_endpoint:
+                print(
+                    "--encoder remote requires --remote-endpoint, e.g. "
+                    "--remote-endpoint https://<host>/encode",
+                    file=sys.stderr,
+                )
+                return 2
+            from .rois import HCP_MMP1_MNI, RegionMasks, cache_dir, load_atlas, synthetic_atlas
 
-        encoder = TribeV2Encoder()
+            atlas_path = args.atlas_path or (cache_dir() / HCP_MMP1_MNI.nifti_filename)
+            if atlas_path.exists():
+                atlas = load_atlas(atlas_path, labels_tsv=args.labels_tsv)
+            else:
+                atlas = synthetic_atlas(shape=(32, 32, 32))
+            masks = RegionMasks.build(atlas)
+            encoder = load_encoder(
+                "remote",
+                endpoint=args.remote_endpoint,
+                token=args.remote_token,
+                timeout_s=args.remote_timeout,
+                request_mode=args.remote_request_mode,
+                response_mode=args.remote_response_mode,
+                masks=masks,
+                voxel_shape=atlas.shape,
+                subcortical_mode=args.remote_subcortical_mode,
+            )
+        else:
+            print(f"unknown encoder: {args.encoder}", file=sys.stderr)
+            return 2
 
     agent = ClaudeAgent() if args.agent == "claude" else MockAgent()
     result = run(
