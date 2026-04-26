@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "/Users/masudip/Desktop/Anirudh/Extracurricular/Computer Science/Hackathons/LA Hacks/NeuralLens/neurallens"
+    ],
+    "allow": [
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
