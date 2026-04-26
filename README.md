@@ -9,7 +9,7 @@ It combines:
 
 ## What We Built
 
-NeuralLens runs an optimization loop:
+NeuralLens runs an optimization loop: 
 
 1. Capture page state (screenshot + extracted text)
 2. Score predicted neural response with a TRIBE-style encoder
