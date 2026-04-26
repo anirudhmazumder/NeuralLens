@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Optional
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -163,8 +166,8 @@ def _write_video(frames: list[Image.Image], video_path: str) -> str:
             writer.append_data(arr)
         writer.close()
         return video_path
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning("imageio video writer failed; falling back to cv2: %s", exc)
 
     # Fallback to cv2
     try:
@@ -172,13 +175,17 @@ def _write_video(frames: list[Image.Image], video_path: str) -> str:
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(video_path, fourcc, 2, (w, h))
+        if not out.isOpened():
+            logger.error("cv2 VideoWriter could not open output path: %s", video_path)
+            return ""
         for arr in arr_frames:
             out.write(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
         out.release()
         return video_path
-    except Exception:
-        pass
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        logger.error("cv2 video writer failed; no scroll video generated: %s", exc)
 
+    logger.error("video generation failed with all available backends: %s", video_path)
     return ""
 
 
@@ -191,6 +198,15 @@ async def _download_audio(src: str, dest: str) -> Optional[str]:
             if resp.status_code == 200:
                 Path(dest).write_bytes(resp.content)
                 return dest
-    except Exception:
-        pass
+            logger.warning(
+                "audio download returned non-200 status (%s) from %s",
+                resp.status_code,
+                src,
+            )
+    except ImportError as exc:
+        logger.warning("httpx unavailable; skipping audio download from %s: %s", src, exc)
+    except (OSError, ValueError) as exc:
+        logger.error("failed writing downloaded audio to %s: %s", dest, exc)
+    except Exception as exc:
+        logger.error("audio download failed from %s: %s", src, exc)
     return None

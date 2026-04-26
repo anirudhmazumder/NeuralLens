@@ -8,6 +8,9 @@ Pipeline: UI screenshot → predicted fMRI activation (TRIBE v2) → ROI scoring
 
 Hackathon scaffolding. The pipeline runs end-to-end today with an **atlas-backed demo encoder** (real HCP-MMP1 masks plus synthetic voxel activations), so you can exercise ROI aggregation and reward dynamics without a GPU. Full TRIBE v2 inference remains behind the `neuro` extra (see `src/neurolens/tribe.py`).
 
+> **TRIBE encoder status:** `--encoder tribe` is a placeholder and is not implemented yet.
+> Use `--encoder atlas` (local demo) or `--encoder remote` (your hosted TRIBE endpoint).
+
 ## Install
 
 ```bash
@@ -19,7 +22,7 @@ pip install -e '.[dev]'      # tests
 ## Run a demo loop
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_KEY=your_anthropic_api_key_here
 neurolens fetch-atlas
 neurolens optimize path/to/screenshot.png --intent engage --iters 5
 ```
@@ -28,6 +31,13 @@ neurolens optimize path/to/screenshot.png --intent engage --iters 5
 
 Outputs land in `runs/<timestamp>/`: per-iteration screenshots, region score JSON, and a plain-language transparency report.
 
+## GitHub + Local Demo Safety
+
+- Keep secrets in local env files only (`.env`), never in committed files.
+- `neurallens/.env.example` is a template; commit it, but do not put real keys in it.
+- Use generic endpoint placeholders in docs (for example `https://<your-host>/encode`).
+- Local artifacts like `*.db`, `runs/`, and `node_modules/` should stay gitignored.
+
 ### Use a remote TRIBE server (e.g. Colab + ngrok)
 
 If you already host TRIBE inference elsewhere, call it with the `remote` encoder:
@@ -35,7 +45,7 @@ If you already host TRIBE inference elsewhere, call it with the `remote` encoder
 ```bash
 neurolens optimize path/to/screenshot.png \
   --encoder remote \
-  --remote-endpoint "https://deluge-glucose-rework.ngrok-free.dev/encode" \
+  --remote-endpoint "https://<your-host>/encode" \
   --remote-timeout 45
 ```
 

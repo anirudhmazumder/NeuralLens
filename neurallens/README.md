@@ -61,13 +61,21 @@ Copy `.env.example` to `.env` and set:
 
 ```bash
 # Use real Anthropic Claude for edit suggestions
-OPENAI_LIVE=true
-ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_LIVE=true
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
 
 # Use a deployed TRIBE v2 endpoint for neural scoring
 TRIBE_LIVE=true
 TRIBE_ENDPOINT=http://your-tribe-server:9090
+TRIBE_TOKEN=your_optional_bearer_token
 ```
+
+## Local-Only Demo Notes
+
+- This backend is intended for local demo use.
+- Keep real credentials only in local `.env` files, never in committed docs/code.
+- If you rotate Colab/ngrok endpoints, update `.env` (not the README).
+- `TRIBE_ENDPOINT` is runtime-configured via env; no ngrok link is hardcoded in backend code.
 
 ## Stub Behavior
 

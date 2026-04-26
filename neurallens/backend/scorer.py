@@ -29,6 +29,8 @@ class TribeScorer:
     def __init__(self) -> None:
         self.live = os.getenv("TRIBE_LIVE", "false").lower() == "true"
         self.endpoint = os.getenv("TRIBE_ENDPOINT", "http://localhost:9090/encode")
+        token = os.getenv("TRIBE_TOKEN", "").strip()
+        self.token = token or None
 
     def _encode_url(self) -> str:
         ep = self.endpoint.rstrip("/")
@@ -77,13 +79,20 @@ class TribeScorer:
         with open(screenshot_path, "rb") as fh:
             png = fh.read()
 
+        headers = {"Content-Type": "image/png"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             # First try raw PNG body (Flask request.data style).
-            r = await client.post(url, content=png, headers={"Content-Type": "image/png"})
+            r = await client.post(url, content=png, headers=headers)
             if r.status_code >= 400:
                 # Fallback to JSON base64 (common FastAPI shape).
                 payload = {"image_base64": base64.b64encode(png).decode(), "text": text}
-                r = await client.post(url, json=payload)
+                json_headers = {"Content-Type": "application/json"}
+                if self.token:
+                    json_headers["Authorization"] = f"Bearer {self.token}"
+                r = await client.post(url, json=payload, headers=json_headers)
             r.raise_for_status()
             data = r.json()
         return self._extract_regions(data)

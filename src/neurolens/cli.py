@@ -36,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=["stub", "atlas", "tribe", "remote"],
         default="atlas",
         help="'stub' = image-feature only, 'atlas' = synthetic voxels through real "
-        "HCP-MMP1, 'tribe' = real TRIBE v2 (TODO), 'remote' = call external TRIBE endpoint.",
+        "HCP-MMP1, 'tribe' = not implemented yet (placeholder), "
+        "'remote' = call external TRIBE endpoint.",
     )
     opt.add_argument(
         "--atlas-path",
@@ -214,7 +215,12 @@ def _optimize(args) -> int:
         encoder = AtlasStubEncoder(atlas=atlas, masks=masks)
     else:
         if args.encoder == "tribe":
-            encoder = load_encoder("tribe")
+            print(
+                "--encoder tribe is not implemented yet. "
+                "Use --encoder atlas for local demos or --encoder remote for a live TRIBE API.",
+                file=sys.stderr,
+            )
+            return 2
         elif args.encoder == "remote":
             if not args.remote_endpoint:
                 print(

@@ -4,12 +4,13 @@ __pycache__/
 .venv/
 venv/
 .env
-neurallens/.env.example
+neurallens/.env
 .pytest_cache/
 .ruff_cache/
 build/
 dist/
 runs/
+*.db
 *.nii
 *.nii.gz
 .DS_Store

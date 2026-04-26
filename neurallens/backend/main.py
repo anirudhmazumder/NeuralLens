@@ -33,6 +33,11 @@ def _cached_screenshot(url: str) -> str:
         return p
     return ""
 
+
+def _tribe_live_enabled() -> bool:
+    return os.getenv("TRIBE_LIVE", "false").lower() == "true"
+
+# Dev-friendly CORS for local demos. Restrict origins before any public deployment.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -214,6 +219,14 @@ async def score_layout(req: ScoreLayoutRequest):
     scorer = TribeScorer()
     full_text = "\n\n".join(c.get("content", "") for c in req.components)
     shot = _cached_screenshot(req.url)
+    if _tribe_live_enabled() and not shot:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "TRIBE_LIVE=true requires a cached screenshot for this URL. "
+                "Call /parse-page first or provide a URL that has already been parsed."
+            ),
+        )
     total_score = await scorer.score("", full_text, "", screenshot_path=shot or None)
 
     per_component = []
@@ -270,6 +283,14 @@ async def apply_edit(req: ApplyEditRequest):
         new_text = req.current_text.replace(original, replacement, 1)
 
     shot = _cached_screenshot(req.url)
+    if _tribe_live_enabled() and not shot:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "TRIBE_LIVE=true requires a cached screenshot for this URL. "
+                "Call /parse-page first before /apply-edit."
+            ),
+        )
     new_score = await scorer.score("", new_text, "", screenshot_path=shot or None)
     score_delta = new_score["overall_score"] - req.current_score.get("overall_score", 0)
     accepted = score_delta > 0
