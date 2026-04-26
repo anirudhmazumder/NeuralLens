@@ -39,6 +39,7 @@ app.add_middleware(
 class OptimizeRequest(BaseModel):
     url: str
     max_iterations: int = 10
+    intent: str = "engage"  # engage | trust | convert | accessibility | gamification
 
 class ParsePageRequest(BaseModel):
     url: str
@@ -72,9 +73,9 @@ class GazeAnalysisRequest(BaseModel):
 @app.get("/health")
 async def health():
     tribe_live = os.getenv("TRIBE_LIVE", "false").lower() == "true"
-    agent_live = os.getenv("OPENAI_LIVE", "false").lower() == "true"
+    agent_live = os.getenv("CLAUDE_LIVE", "false").lower() == "true"
     mode = "live" if (tribe_live or agent_live) else "stub"
-    return {"status": "ok", "mode": mode}
+    return {"status": "ok", "mode": mode, "agent": "claude-sonnet-4-6" if agent_live else "stub"}
 
 
 # ── Optimization job ───────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ async def start_optimization(req: OptimizeRequest, background_tasks: BackgroundT
     jobs[job_id] = job
 
     loop = OptimizationLoop()
-    background_tasks.add_task(loop.run, req.url, req.max_iterations, job_id)
+    background_tasks.add_task(loop.run, req.url, req.max_iterations, job_id, req.intent)
     return {"job_id": job_id}
 
 
@@ -329,6 +330,49 @@ async def gaze_analysis_endpoint(req: GazeAnalysisRequest):
         "salient_regions": gaze_data["regions"],
         "heatmap_overlay_base64": heatmap_b64,
         "gaze_live": gaze_data.get("gaze_live", False),
+    }
+
+
+@app.get("/brain-regions/{job_id}")
+async def brain_regions_for_job(job_id: str):
+    """Return the latest brain region scores and ethics flags for a running/complete job."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    brain_evt = next(
+        (e for e in reversed(job.events) if e.get("type") == "brain_regions"),
+        None,
+    )
+    if not brain_evt:
+        raise HTTPException(status_code=404, detail="No brain region data yet")
+    return brain_evt["data"]
+
+
+@app.post("/score-brain-regions")
+async def score_brain_regions_endpoint(req: GazeAnalysisRequest):
+    """Score all 9 HCP-MMP1 regions for a given URL or screenshot path."""
+    scorer = TribeScorer()
+
+    screenshot_path = ""
+    if req.screenshot_path and Path(req.screenshot_path).exists():
+        screenshot_path = req.screenshot_path
+    elif req.url and req.url in _screenshot_cache and Path(_screenshot_cache[req.url]).exists():
+        screenshot_path = _screenshot_cache[req.url]
+    elif req.url:
+        from scraper import scrape
+        work_dir = os.path.join(tempfile.gettempdir(), "neurallens_brain", str(uuid.uuid4()))
+        os.makedirs(work_dir, exist_ok=True)
+        page = await scrape(req.url, work_dir)
+        screenshot_path = page.screenshot_path
+        _screenshot_cache[req.url] = screenshot_path
+
+    regions = await scorer.score_brain_regions(screenshot_path or None)
+    from brain_regions import evaluate_ethics, REGION_CATEGORIES
+    ethics = evaluate_ethics(regions, "engage")
+    return {
+        "regions": regions,
+        "categories": REGION_CATEGORIES,
+        "ethics_flags": ethics,
     }
 
 

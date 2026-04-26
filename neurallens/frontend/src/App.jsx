@@ -5,6 +5,7 @@ import {
 } from 'recharts'
 import Editor from './Editor'
 import AgentVisionPanel from './AgentVisionPanel'
+import BrainPanel from './BrainPanel'
 
 const API = ''  // proxied through Vite dev server
 
@@ -47,6 +48,10 @@ export default function App() {
   const [memoryStats, setMemoryStats] = useState(null)
   const [events, setEvents] = useState([])               // raw SSE events for AgentVisionPanel
   const [agentVisionActive, setAgentVisionActive] = useState(false)
+  const [intent, setIntent] = useState('engage')
+  const [brainRegions, setBrainRegions] = useState(null)
+  const [ethicsFlags, setEthicsFlags] = useState([])
+  const [intentReward, setIntentReward] = useState(null)
 
   const esRef = useRef(null)
   const feedRef = useRef(null)
@@ -115,10 +120,18 @@ export default function App() {
       }
     }
 
+    if (type === 'brain_regions') {
+      setBrainRegions(data.regions)
+      setEthicsFlags(data.ethics_flags || [])
+      if (data.intent_reward != null) setIntentReward(data.intent_reward)
+    }
+
     if (type === 'complete') {
       setStatus('complete')
       setFinalScore(data.final_score)
       if (data.accepted_edits) setAcceptedEdits(data.accepted_edits)
+      if (data.final_brain_regions) setBrainRegions(data.final_brain_regions)
+      if (data.ethics_flags) setEthicsFlags(data.ethics_flags)
       setJobIdForPreview(data.job_id)
       esRef.current?.close()
     }
@@ -150,12 +163,15 @@ export default function App() {
     setAcceptedEdits([])
     setJobIdForPreview(null)
     setPreviewTab('after')
+    setBrainRegions(null)
+    setEthicsFlags([])
+    setIntentReward(null)
 
     try {
       const res = await fetch(`${API}/optimize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim(), max_iterations: maxIter }),
+        body: JSON.stringify({ url: url.trim(), max_iterations: maxIter, intent }),
       })
       if (!res.ok) throw new Error(`Server error: HTTP ${res.status}`)
       const { job_id } = await res.json()
@@ -352,6 +368,21 @@ export default function App() {
                   className="w-14 bg-gray-900 border border-gray-700 rounded px-2 py-2 text-sm text-white text-center focus:outline-none focus:border-violet-500 disabled:opacity-50"
                 />
               </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-500 whitespace-nowrap">Intent:</span>
+                <select
+                  value={intent}
+                  onChange={e => setIntent(e.target.value)}
+                  disabled={isRunning}
+                  className="bg-gray-900 border border-gray-700 rounded px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 disabled:opacity-50 cursor-pointer"
+                >
+                  <option value="engage">Engage</option>
+                  <option value="trust">Trust</option>
+                  <option value="convert">Convert</option>
+                  <option value="accessibility">Accessibility</option>
+                  <option value="gamification">Gamification</option>
+                </select>
+              </div>
               <button
                 onClick={startOptimization}
                 disabled={!url.trim() || isRunning}
@@ -436,6 +467,18 @@ export default function App() {
             )}
           </div>
 
+          {/* Brain activation panel */}
+          {(brainRegions || status === 'running' || status === 'complete') && (
+            <div className="flex-shrink-0">
+              <BrainPanel
+                regions={brainRegions}
+                ethicsFlags={ethicsFlags}
+                intent={intent}
+                intentReward={intentReward}
+              />
+            </div>
+          )}
+
           {/* Memory / Learning panel */}
           {memoryStats && Object.keys(memoryStats).length > 0 && (
             <MemoryPanel stats={memoryStats} />
@@ -484,9 +527,10 @@ export default function App() {
                   {[
                     ['🎬', 'Simulates a human scrolling your page via Playwright'],
                     ['🧬', 'Passes video + text + audio to TRIBE v2 brain encoder'],
-                    ['🤖', 'AI agent proposes targeted text edits'],
-                    ['🔁', 'Iterates using neural activation as the reward signal'],
-                    ['📈', 'Accepts edits that improve predicted brain engagement'],
+                    ['🧠', 'Scores 9 HCP-MMP1 regions: Amygdala, Hippocampus, NAcc + 6 more'],
+                    ['🤖', 'Claude agent proposes targeted text edits based on gaze + brain data'],
+                    ['🔁', 'Iterates using intent-aware neural reward signal'],
+                    ['📈', 'Accepts edits that improve brain engagement within ethical guardrails'],
                   ].map(([icon, text]) => (
                     <li key={text} className="flex items-start gap-2">
                       <span className="mt-0.5">{icon}</span>
