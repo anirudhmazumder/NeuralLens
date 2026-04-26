@@ -15,5 +15,6 @@ runs/
 *.nii.gz
 .DS_Store
 .gitignore
+.claude/
 node_modules/
 neurallens/frontend/node_modules/
