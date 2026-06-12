@@ -1,6 +1,6 @@
 # NeuralLens
 
-NeuralLens is an AI system for optimizing webpages using predicted neural engagement, gaze saliency, and iterative agent-driven edits.
+NeuralLens is an AI system for optimizing webpages and marketing images using predicted neural engagement, gaze saliency, and iterative agent-driven edits. 
 
 It combines:
 - a web app for live URL + HTML upload optimization,
@@ -12,7 +12,7 @@ It combines:
 NeuralLens runs an optimization loop: 
 
 1. Capture page state (screenshot + extracted text)
-2. Score predicted neural response with a TRIBE-style encoder
+2. Score predicted neural response with a Meta's TRIBE v2 fMRI encoder (open-sourced March 2026) with a GPU inference layer we built on an A100
 3. Run gaze analysis to locate highest-attention regions
 4. Let an LLM agent propose one focused edit
 5. Re-score and accept only improvements
@@ -20,9 +20,9 @@ NeuralLens runs an optimization loop:
 
 For hackathon use, this enables teams to improve web engagement before shipping or spending on traffic.
 
-## Multi-Agent Deployment (FetchAI Agenteverse)
+## Multi-Agent Deployment (FetchAI Agentverse)
 
-We have deployed our multi-agent orchestration layer into **FetchAI Agenteverse**.  
+We have deployed our multi-agent orchestration layer into **FetchAI Agentverse**.  
 That deployment can interface with NeuralLens by:
 
 - receiving optimization tasks from external agent workflows,
